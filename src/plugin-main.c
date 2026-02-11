@@ -36,8 +36,12 @@ static const char *filter_get_name(void *unused)
 
 /* ------------------------------------------------------------------------- */
 /* 滤镜：核心视频回调（现在什么都不做，直接返回原帧） */
+/* ⚠️ 注意：这是 C 语言，必须写 struct obs_source_frame */
 
-static obs_source_frame *filter_video(void *data, obs_source_frame *frame)
+static struct obs_source_frame *filter_video(
+	void *data,
+	struct obs_source_frame *frame
+)
 {
 	UNUSED_PARAMETER(data);
 
