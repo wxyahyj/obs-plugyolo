@@ -19,11 +19,50 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <obs-module.h>
 #include <plugin-support.h>
 
+/* ------------------------------------------------------------------------- */
+/* OBS module boilerplate */
+
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE(PLUGIN_NAME, "en-US")
 
+/* ------------------------------------------------------------------------- */
+/* 滤镜：名字（显示在 OBS UI 里） */
+
+static const char *filter_get_name(void *unused)
+{
+	UNUSED_PARAMETER(unused);
+	return "操作显示";
+}
+
+/* ------------------------------------------------------------------------- */
+/* 滤镜：核心视频回调（现在什么都不做，直接返回原帧） */
+
+static obs_source_frame *filter_video(void *data, obs_source_frame *frame)
+{
+	UNUSED_PARAMETER(data);
+
+	/* 这里以后就是你加 YOLO / 跟踪 / 逻辑 的地方 */
+	return frame;
+}
+
+/* ------------------------------------------------------------------------- */
+/* 滤镜类型定义（最关键的结构体） */
+
+static struct obs_source_info filter_info = {
+	.id = "my_first_obs_filter",
+	.type = OBS_SOURCE_TYPE_FILTER,     /* ← 这行决定：这是“滤镜” */
+	.output_flags = OBS_SOURCE_VIDEO,
+
+	.get_name = filter_get_name,
+	.filter_video = filter_video,
+};
+
+/* ------------------------------------------------------------------------- */
+/* 模块加载 / 卸载 */
+
 bool obs_module_load(void)
 {
+	obs_register_source(&filter_info);  /* 注册滤镜 */
 	obs_log(LOG_INFO, "plugin loaded successfully (version %s)", PLUGIN_VERSION);
 	return true;
 }
