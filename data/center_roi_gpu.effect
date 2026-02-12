@@ -1,16 +1,10 @@
 // -------------------------------------------------------------------------
 // OBS GPU Filter Shader - Center ROI GPU
-// 功能：处理 NV12 纹理，绘制红色框，提取中心 ROI
+// 功能：处理 RGBA 纹理，绘制红色框，提取中心 ROI
 // -------------------------------------------------------------------------
 
-// 输入纹理：NV12 格式
-// Y 平面纹理（亮度）
-Texture2D tex_y : register(t0);
-SamplerState sam_y : register(s0);
-
-// UV 平面纹理（色度，交错 UV）
-Texture2D tex_uv : register(t1);
-SamplerState sam_uv : register(s1);
+// 输入纹理：RGBA 格式
+sampler2D image : register(s0);
 
 // -------------------------------------------------------------------------
 // Uniform 参数（从 C 代码传入）
@@ -32,66 +26,34 @@ uniform float4 box_color = {1.0, 0.0, 0.0, 1.0};
 uniform float box_width = 1.0;
 
 // -------------------------------------------------------------------------
-// 顶点着色器
+// 顶点着色器 - 使用 OBS 默认顶点着色器
 // -------------------------------------------------------------------------
 
-struct VertexData {
+struct VertData {
 	float4 pos : POSITION;
-	float2 uv : TEXCOORD0;
+	float2 uv  : TEXCOORD0;
 };
 
-VertexData VSDefault(VertexData input)
+VertData mainVS(VertData v_in)
 {
-	VertexData output;
-	output.pos = input.pos;
-	output.uv = input.uv;
-	return output;
-}
-
-// -------------------------------------------------------------------------
-// NV12 → RGB 转换函数（BT.601 标准）
-// 公式：
-//   R = Y + 1.402 * (V - 128)
-//   G = Y - 0.34414 * (U - 128) - 0.71414 * (V - 128)
-//   B = Y + 1.772 * (U - 128)
-// 其中 U 和 V 从 UV 纹理中交错读取
-// -------------------------------------------------------------------------
-
-float3 NV12ToRGB(float y, float u, float v)
-{
-	// 将 YUV 转换为 0-1 范围
-	float Y = y / 255.0;
-	float U = (u - 128.0) / 255.0;
-	float V = (v - 128.0) / 255.0;
-
-	// BT.601 转换矩阵
-	float R = Y + 1.402 * V;
-	float G = Y - 0.34414 * U - 0.71414 * V;
-	float B = Y + 1.772 * U;
-
-	return float3(R, G, B);
+	VertData v_out;
+	v_out.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj);
+	v_out.uv  = v_in.uv;
+	return v_out;
 }
 
 // -------------------------------------------------------------------------
 // 像素着色器 - 正常渲染 + 绘制红色框
-// 功能：将 NV12 转换为 RGB，并在画面中央绘制 320x320 红色线框
+// 功能：渲染 RGBA 纹理，并在画面中央绘制红色线框
 // -------------------------------------------------------------------------
 
-float4 PSNormal(VertexData input) : TARGET
+float4 PSNormal(VertData input) : TARGET
 {
 	// 获取当前像素坐标（像素空间）
 	float2 pixel_pos = input.uv * image_size.xy;
 
-	// 采样 Y 平面
-	float y = tex_y.Sample(sam_y, input.uv).r * 255.0;
-
-	// 采样 UV 平面（交错 UV）
-	float2 uv_data = tex_uv.Sample(sam_uv, input.uv).rg * 255.0;
-	float u = uv_data.r;
-	float v = uv_data.g;
-
-	// NV12 → RGB 转换
-	float3 rgb = NV12ToRGB(y, u, v);
+	// 采样 RGBA 纹理
+	float4 color = tex2D(image, input.uv);
 
 	// -------------------------------------------------------------------------
 	// 计算红色框区域
@@ -118,17 +80,16 @@ float4 PSNormal(VertexData input) : TARGET
 		return box_color;
 	}
 
-	// 否则返回原始 RGB
-	return float4(rgb, 1.0);
+	// 否则返回原始颜色
+	return color;
 }
 
 // -------------------------------------------------------------------------
-// 像素着色器 - 只输出中心 ROI（用于 YOLO）
-// 功能：只渲染中心 320x320 区域，输出为 RGB
-// 如果当前像素不在 ROI 区域内，返回黑色
+// 像素着色器 - 只输出中心 ROI
+// 功能：只渲染中心 ROI 区域，其余区域为黑色
 // -------------------------------------------------------------------------
 
-float4 PSROI(VertexData input) : TARGET
+float4 PSROI(VertData input) : TARGET
 {
 	// 获取当前像素坐标（像素空间）
 	float2 pixel_pos = input.uv * image_size.xy;
@@ -146,18 +107,8 @@ float4 PSROI(VertexData input) : TARGET
 		return float4(0.0, 0.0, 0.0, 1.0);
 	}
 
-	// 采样 Y 平面
-	float y = tex_y.Sample(sam_y, input.uv).r * 255.0;
-
-	// 采样 UV 平面
-	float2 uv_data = tex_uv.Sample(sam_uv, input.uv).rg * 255.0;
-	float u = uv_data.r;
-	float v = uv_data.g;
-
-	// NV12 → RGB 转换
-	float3 rgb = NV12ToRGB(y, u, v);
-
-	return float4(rgb, 1.0);
+	// 在 ROI 区域内，返回原始颜色
+	return tex2D(image, input.uv);
 }
 
 // -------------------------------------------------------------------------
@@ -168,7 +119,7 @@ technique NormalRender
 {
 	pass
 	{
-		vertex_shader = VSDefault(input);
+		vertex_shader = mainVS(input);
 		pixel_shader = PSNormal(input);
 	}
 }
@@ -181,7 +132,7 @@ technique ROIRender
 {
 	pass
 	{
-		vertex_shader = VSDefault(input);
+		vertex_shader = mainVS(input);
 		pixel_shader = PSROI(input);
 	}
 }
