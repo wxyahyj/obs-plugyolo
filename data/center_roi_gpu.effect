@@ -4,7 +4,7 @@
 // -------------------------------------------------------------------------
 
 // 输入纹理：RGBA 格式
-sampler2D image : register(s0);
+uniform texture2d image;
 
 // -------------------------------------------------------------------------
 // Uniform 参数（从 C 代码传入）
@@ -20,7 +20,7 @@ uniform float4 roi_size;
 uniform float4 roi_center;
 
 // 红色框颜色 (r, g, b, a) - 红色
-uniform float4 box_color = {1.0, 0.0, 0.0, 1.0};
+uniform float4 box_color = float4(1.0, 0.0, 0.0, 1.0);
 
 // 红色框线宽（像素）
 uniform float box_width = 1.0;
@@ -34,7 +34,7 @@ struct VertData {
 	float2 uv  : TEXCOORD0;
 };
 
-VertData mainVS(VertData v_in)
+VertData DefaultVS(VertData v_in)
 {
 	VertData v_out;
 	v_out.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj);
@@ -53,7 +53,7 @@ float4 PSNormal(VertData input) : TARGET
 	float2 pixel_pos = input.uv * image_size.xy;
 
 	// 采样 RGBA 纹理
-	float4 color = tex2D(image, input.uv);
+	float4 color = image.Sample(LinearClamp, input.uv);
 
 	// -------------------------------------------------------------------------
 	// 计算红色框区域
@@ -108,7 +108,7 @@ float4 PSROI(VertData input) : TARGET
 	}
 
 	// 在 ROI 区域内，返回原始颜色
-	return tex2D(image, input.uv);
+	return image.Sample(LinearClamp, input.uv);
 }
 
 // -------------------------------------------------------------------------
@@ -119,7 +119,7 @@ technique NormalRender
 {
 	pass
 	{
-		vertex_shader = mainVS(input);
+		vertex_shader = DefaultVS(input);
 		pixel_shader = PSNormal(input);
 	}
 }
@@ -132,7 +132,7 @@ technique ROIRender
 {
 	pass
 	{
-		vertex_shader = mainVS(input);
+		vertex_shader = DefaultVS(input);
 		pixel_shader = PSROI(input);
 	}
 }
