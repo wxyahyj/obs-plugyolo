@@ -70,43 +70,39 @@ static void *filter_create(obs_data_t *settings, obs_source_t *source)
 	data->roi_texture = NULL;
 	pthread_mutex_init(&data->roi_mutex, NULL);
 
+	// 尝试创建 shader effect，但即使失败也继续运行（使用 CPU 模式）
 	char *effect_path = obs_module_file("center_roi_gpu.effect");
-	if (!effect_path) {
-		obs_log(LOG_ERROR, "Failed to find center_roi_gpu.effect");
-		pthread_mutex_destroy(&data->roi_mutex);
-		bfree(data);
-		return NULL;
+	if (effect_path) {
+		data->effect = gs_effect_create_from_file(effect_path, NULL);
+		bfree(effect_path);
+
+		if (data->effect) {
+			data->param_image_size = gs_effect_get_param_by_name(data->effect, "image_size");
+			data->param_roi_size = gs_effect_get_param_by_name(data->effect, "roi_size");
+			data->param_roi_center = gs_effect_get_param_by_name(data->effect, "roi_center");
+			data->param_box_color = gs_effect_get_param_by_name(data->effect, "box_color");
+			data->param_box_width = gs_effect_get_param_by_name(data->effect, "box_width");
+
+			data->tech_normal = gs_effect_get_technique(data->effect, "NormalRender");
+
+			if (!data->tech_normal) {
+				obs_log(LOG_WARNING, "Failed to get NormalRender technique from effect, falling back to CPU mode");
+				gs_effect_destroy(data->effect);
+				data->effect = NULL;
+			}
+		} else {
+			obs_log(LOG_WARNING, "Failed to create effect from center_roi_gpu.effect, falling back to CPU mode");
+		}
+	} else {
+		obs_log(LOG_WARNING, "Failed to find center_roi_gpu.effect, falling back to CPU mode");
 	}
 
-	data->effect = gs_effect_create_from_file(effect_path, NULL);
-	bfree(effect_path);
-
-	if (!data->effect) {
-		obs_log(LOG_ERROR, "Failed to create effect from center_roi_gpu.effect");
-		pthread_mutex_destroy(&data->roi_mutex);
-		bfree(data);
-		return NULL;
-	}
-
-	data->param_image_size = gs_effect_get_param_by_name(data->effect, "image_size");
-	data->param_roi_size = gs_effect_get_param_by_name(data->effect, "roi_size");
-	data->param_roi_center = gs_effect_get_param_by_name(data->effect, "roi_center");
-	data->param_box_color = gs_effect_get_param_by_name(data->effect, "box_color");
-	data->param_box_width = gs_effect_get_param_by_name(data->effect, "box_width");
-
-	data->tech_normal = gs_effect_get_technique(data->effect, "NormalRender");
-
-	if (!data->tech_normal) {
-		obs_log(LOG_ERROR, "Failed to get NormalRender technique from effect");
-		gs_effect_destroy(data->effect);
-		pthread_mutex_destroy(&data->roi_mutex);
-		bfree(data);
-		return NULL;
-	}
+	// 分配 ROI 缓冲区
+	data->roi_buffer = bzalloc(ROI_SIZE * ROI_SIZE * ROI_CHANNELS);
 
 	g_filter_data = data;
 
-	obs_log(LOG_INFO, "Filter created successfully");
+	obs_log(LOG_INFO, "Filter created successfully (mode: %s)", data->effect ? "GPU" : "CPU");
 	return data;
 }
 
@@ -411,55 +407,64 @@ static void video_render(void *data, gs_effect_t *effect)
 	if (width == 0 || height == 0) 
 		return;
 
-	update_roi_texture(filter, width, height);
+	// 只有在 shader 可用时才执行 GPU 渲染
+	if (filter->effect) {
+		update_roi_texture(filter, width, height);
 
-	if (!obs_source_process_filter_begin(filter->context, GS_RGBA, OBS_ALLOW_DIRECT_RENDERING)) 
-		return;
+		if (!obs_source_process_filter_begin(filter->context, GS_RGBA, OBS_ALLOW_DIRECT_RENDERING)) 
+			return;
 
-	struct vec4 image_size;
-	vec4_set(&image_size, (float)width, (float)height,
-		 1.0f / (float)width, 1.0f / (float)height);
+		struct vec4 image_size;
+		vec4_set(&image_size, (float)width, (float)height,
+			 1.0f / (float)width, 1.0f / (float)height);
 
-	struct vec4 roi_size;
-	vec4_set(&roi_size, (float)ROI_SIZE, (float)ROI_SIZE, 0.0f, 0.0f);
+		struct vec4 roi_size;
+		vec4_set(&roi_size, (float)ROI_SIZE, (float)ROI_SIZE, 0.0f, 0.0f);
 
-	struct vec4 roi_center;
-	vec4_set(&roi_center, (float)width / 2.0f, (float)height / 2.0f, 0.0f, 0.0f);
+		struct vec4 roi_center;
+		vec4_set(&roi_center, (float)width / 2.0f, (float)height / 2.0f, 0.0f, 0.0f);
 
-	struct vec4 box_color;
-	vec4_set(&box_color, 1.0f, 0.0f, 0.0f, 1.0f);
+		struct vec4 box_color;
+		vec4_set(&box_color, 1.0f, 0.0f, 0.0f, 1.0f);
 
-	gs_effect_set_vec4(filter->param_image_size, &image_size);
-	gs_effect_set_vec4(filter->param_roi_size, &roi_size);
-	gs_effect_set_vec4(filter->param_roi_center, &roi_center);
-	gs_effect_set_vec4(filter->param_box_color, &box_color);
-	gs_effect_set_float(filter->param_box_width, 1.0f);
+		gs_effect_set_vec4(filter->param_image_size, &image_size);
+		gs_effect_set_vec4(filter->param_roi_size, &roi_size);
+		gs_effect_set_vec4(filter->param_roi_center, &roi_center);
+		gs_effect_set_vec4(filter->param_box_color, &box_color);
+		gs_effect_set_float(filter->param_box_width, 1.0f);
 
-	gs_technique_begin(filter->tech_normal);
-	gs_technique_begin_pass(filter->tech_normal, 0);
+		gs_technique_begin(filter->tech_normal);
+		gs_technique_begin_pass(filter->tech_normal, 0);
 
-	gs_draw_sprite(NULL, 0, width, height);
+		gs_draw_sprite(NULL, 0, width, height);
 
-	gs_technique_end_pass(filter->tech_normal);
-	gs_technique_end(filter->tech_normal);
+		gs_technique_end_pass(filter->tech_normal);
+		gs_technique_end(filter->tech_normal);
 
-	obs_source_process_filter_end(filter->context, effect, width, height);
+		obs_source_process_filter_end(filter->context, effect, width, height);
 
-	// 在插件支持被禁用的 CI 环境中，跳过 ROI 提取逻辑
-	// obs_filter_get_video_texture 等 API 在禁用插件支持时不可用
-	// 保留 ROI 逻辑但跳过实际执行，确保编译通过
-	if (0) {
-		render_roi_to_texture(filter, NULL);
-		copy_roi_to_cpu(filter);
+		// 在插件支持被禁用的 CI 环境中，跳过 ROI 提取逻辑
+		// obs_filter_get_video_texture 等 API 在禁用插件支持时不可用
+		// 保留 ROI 逻辑但跳过实际执行，确保编译通过
+		if (0) {
+			render_roi_to_texture(filter, NULL);
+			copy_roi_to_cpu(filter);
+		}
+	} else {
+		// 当 shader 不可用时，直接传递原始帧
+		obs_source_process_filter_begin(filter->context, GS_RGBA, OBS_ALLOW_DIRECT_RENDERING);
+		gs_draw_sprite(NULL, 0, width, height);
+		obs_source_process_filter_end(filter->context, effect, width, height);
 	}
 
 	filter->frame_count++;
 
 	if (filter->frame_count % 300 == 0) {
 		obs_log(LOG_INFO,
-			"[MYFILTER] Video render | Size: %dx%d | ROI ready: %s",
+			"[MYFILTER] Video render | Size: %dx%d | ROI ready: %s | Mode: %s",
 			width, height,
-			filter->roi_ready ? "Yes" : "No");
+			filter->roi_ready ? "Yes" : "No",
+			filter->effect ? "GPU" : "CPU");
 	}
 }
 
