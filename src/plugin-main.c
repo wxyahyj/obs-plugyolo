@@ -17,322 +17,405 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 */
 
 #include <obs-module.h>
+#include <graphics/graphics.h>
+#include <graphics/matrix4.h>
 #include <plugin-support.h>
-#include <stdint.h>
-#include <stdlib.h>
-#include <string.h>
+#include <util/threading.h>
+#include <util/platform.h>
+#include <util/darray.h>
 
-#define ROI_W 320
-#define ROI_H 320
+#define ROI_SIZE 320
 
-/* ------------------------------------------------------------------------- */
-/* OBS module boilerplate */
+static my_filter_data_t *g_filter_data = NULL;
 
-OBS_DECLARE_MODULE()
-OBS_MODULE_USE_DEFAULT_LOCALE(PLUGIN_NAME, "en-US")
+typedef struct {
+	obs_source_t *context;
+	gs_effect_t *effect;
+	gs_eparam_t *param_image_size;
+	gs_eparam_t *param_roi_size;
+	gs_eparam_t *param_roi_center;
+	gs_eparam_t *param_box_color;
+	gs_eparam_t *param_box_width;
+	gs_technique_t *tech_normal;
+	gs_technique_t *tech_roi;
 
-/* ------------------------------------------------------------------------- */
-/* 滤镜上下文 */
+	gs_texture_t *output_texture;
+	gs_texture_t *roi_texture;
 
-struct my_filter_data {
-    obs_source_t *context;
+	uint32_t width;
+	uint32_t height;
 
-    uint64_t frame_count;
-
-    uint8_t *roi_rgb; /* ROI 输出缓冲区 */
-    int roi_w;
-    int roi_h;
-};
-
-/* ------------------------------------------------------------------------- */
-/* 工具函数 */
-
-static inline int clamp_int(int v, int min_v, int max_v)
-{
-    if (v < min_v) return min_v;
-    if (v > max_v) return max_v;
-    return v;
-}
-
-/* NV12 → RGB（BT.601） */
-static inline void yuv_to_rgb(uint8_t Y, uint8_t U, uint8_t V,
-                              uint8_t *R, uint8_t *G, uint8_t *B)
-{
-    int C = (int)Y - 16;
-    int D = (int)U - 128;
-    int E = (int)V - 128;
-
-    int r = (298 * C + 409 * E + 128) >> 8;
-    int g = (298 * C - 100 * D - 208 * E + 128) >> 8;
-    int b = (298 * C + 516 * D + 128) >> 8;
-
-    if (r < 0) r = 0; else if (r > 255) r = 255;
-    if (g < 0) g = 0; else if (g > 255) g = 255;
-    if (b < 0) b = 0; else if (b > 255) b = 255;
-
-    *R = (uint8_t)r;
-    *G = (uint8_t)g;
-    *B = (uint8_t)b;
-}
-
-/* ------------------------------------------------------------------------- */
-/* 在 NV12 中心画 320×320 框 */
-
-static void draw_center_box_nv12(struct obs_source_frame *frame,
-                                 int box_w, int box_h)
-{
-    if (!frame || frame->format != VIDEO_FORMAT_NV12)
-        return;
-
-    int width  = (int)frame->width;
-    int height = (int)frame->height;
-
-    uint8_t *Yp  = frame->data[0];
-    uint8_t *UVp = frame->data[1];
-    int ys = frame->linesize[0];
-    int uvs = frame->linesize[1];
-
-    int cx = width / 2;
-    int cy = height / 2;
-
-    int left   = cx - box_w / 2;
-    int right  = left + box_w - 1;
-    int top    = cy - box_h / 2;
-    int bottom = top + box_h - 1;
-
-    left   = clamp_int(left,   0, width - 1);
-    right  = clamp_int(right,  0, width - 1);
-    top    = clamp_int(top,    0, height - 1);
-    bottom = clamp_int(bottom, 0, height - 1);
-
-    /* 红色（近似） */
-    const uint8_t Yv = 81;
-    const uint8_t Uv = 90;
-    const uint8_t Vv = 240;
-
-    const int thickness = 2;
-
-    /* 画水平线 */
-    for (int t = 0; t < thickness; t++) {
-        int y1 = top + t;
-        int y2 = bottom - t;
-
-        if (y1 >= 0 && y1 < height) {
-            uint8_t *row = Yp + y1 * ys;
-            for (int x = left; x <= right; x++) {
-                row[x] = Yv;
-                uint8_t *uv = UVp + (y1 / 2) * uvs + (x / 2) * 2;
-                uv[0] = Uv; uv[1] = Vv;
-            }
-        }
-
-        if (y2 >= 0 && y2 < height && y2 != y1) {
-            uint8_t *row = Yp + y2 * ys;
-            for (int x = left; x <= right; x++) {
-                row[x] = Yv;
-                uint8_t *uv = UVp + (y2 / 2) * uvs + (x / 2) * 2;
-                uv[0] = Uv; uv[1] = Vv;
-            }
-        }
-    }
-
-    /* 画竖线 */
-    for (int t = 0; t < thickness; t++) {
-        int x1 = left + t;
-        int x2 = right - t;
-
-        if (x1 >= 0 && x1 < width) {
-            for (int y = top; y <= bottom; y++) {
-                uint8_t *row = Yp + y * ys;
-                row[x1] = Yv;
-                uint8_t *uv = UVp + (y / 2) * uvs + (x1 / 2) * 2;
-                uv[0] = Uv; uv[1] = Vv;
-            }
-        }
-
-        if (x2 >= 0 && x2 < width && x2 != x1) {
-            for (int y = top; y <= bottom; y++) {
-                uint8_t *row = Yp + y * ys;
-                row[x2] = Yv;
-                uint8_t *uv = UVp + (y / 2) * uvs + (x2 / 2) * 2;
-                uv[0] = Uv; uv[1] = Vv;
-            }
-        }
-    }
-}
-
-/* ------------------------------------------------------------------------- */
-/* 提取中心 ROI（NV12 → RGB） */
-
-static bool extract_center_roi_rgb(const struct obs_source_frame *frame,
-                                   int roi_w, int roi_h,
-                                   uint8_t *out)
-{
-    if (!frame || !out)
-        return false;
-
-    if (frame->format != VIDEO_FORMAT_NV12)
-        return false;
-
-    int width  = frame->width;
-    int height = frame->height;
-
-    if (roi_w > width || roi_h > height)
-        return false;
-
-    const uint8_t *Yp  = frame->data[0];
-    const uint8_t *UVp = frame->data[1];
-    int ys  = frame->linesize[0];
-    int uvs = frame->linesize[1];
-
-    int cx = width / 2;
-    int cy = height / 2;
-
-    int left = clamp_int(cx - roi_w / 2, 0, width  - roi_w);
-    int top  = clamp_int(cy - roi_h / 2, 0, height - roi_h);
-
-    for (int j = 0; j < roi_h; j++) {
-        for (int i = 0; i < roi_w; i++) {
-
-            int x = left + i;
-            int y = top  + j;
-
-            uint8_t Y = Yp[y * ys + x];
-
-            const uint8_t *uv = UVp + (y / 2) * uvs + (x / 2) * 2;
-            uint8_t U = uv[0];
-            uint8_t V = uv[1];
-
-            uint8_t R, G, B;
-            yuv_to_rgb(Y, U, V, &R, &G, &B);
-
-            int idx = (j * roi_w + i) * 3;
-            out[idx + 0] = R;
-            out[idx + 1] = G;
-            out[idx + 2] = B;
-        }
-    }
-
-    return true;
-}
-
-/* ------------------------------------------------------------------------- */
-/* 滤镜：名字 */
+	int frame_count;
+	pthread_mutex_t roi_mutex;
+	uint8_t *roi_data_cpu;
+	bool roi_ready;
+} my_filter_data_t;
 
 static const char *filter_get_name(void *unused)
 {
-    UNUSED_PARAMETER(unused);
-    return "操作显示";
+	UNUSED_PARAMETER(unused);
+	return "操作显示";
 }
-
-/* ------------------------------------------------------------------------- */
-/* create / destroy */
 
 static void *filter_create(obs_data_t *settings, obs_source_t *source)
 {
-    UNUSED_PARAMETER(settings);
+	UNUSED_PARAMETER(settings);
 
-    struct my_filter_data *f = bzalloc(sizeof(*f));
-    f->context = source;
-    f->frame_count = 0;
+	my_filter_data_t *data = bzalloc(sizeof(my_filter_data_t));
+	data->context = source;
+	data->frame_count = 0;
+	data->roi_ready = false;
+	data->roi_data_cpu = NULL;
+	pthread_mutex_init(&data->roi_mutex, NULL);
 
-    f->roi_w = ROI_W;
-    f->roi_h = ROI_H;
-    f->roi_rgb = bmalloc(ROI_W * ROI_H * 3);
+	char *effect_path = obs_module_file("center_roi_gpu.effect");
+	if (!effect_path) {
+		obs_log(LOG_ERROR, "Failed to find center_roi_gpu.effect");
+		bfree(data);
+		return NULL;
+	}
 
-    return f;
+	data->effect = gs_effect_create_from_file(effect_path, NULL);
+	bfree(effect_path);
+
+	if (!data->effect) {
+		obs_log(LOG_ERROR, "Failed to create effect from center_roi_gpu.effect");
+		bfree(data);
+		return NULL;
+	}
+
+	data->param_image_size = gs_effect_get_param_by_name(data->effect, "image_size");
+	data->param_roi_size = gs_effect_get_param_by_name(data->effect, "roi_size");
+	data->param_roi_center = gs_effect_get_param_by_name(data->effect, "roi_center");
+	data->param_box_color = gs_effect_get_param_by_name(data->effect, "box_color");
+	data->param_box_width = gs_effect_get_param_by_name(data->effect, "box_width");
+
+	data->tech_normal = gs_effect_get_technique(data->effect, "NormalRender");
+	data->tech_roi = gs_effect_get_technique(data->effect, "ROIRender");
+
+	if (!data->tech_normal || !data->tech_roi) {
+		obs_log(LOG_ERROR, "Failed to get techniques from effect");
+		gs_effect_destroy(data->effect);
+		bfree(data);
+		return NULL;
+	}
+
+	g_filter_data = data;
+
+	obs_log(LOG_INFO, "Filter created successfully");
+	return data;
 }
 
 static void filter_destroy(void *data)
 {
-    struct my_filter_data *f = data;
-    if (!f) return;
+	my_filter_data_t *filter = data;
 
-    if (f->roi_rgb)
-        bfree(f->roi_rgb);
+	if (!filter)
+		return;
 
-    bfree(f);
-}
+	pthread_mutex_destroy(&filter->roi_mutex);
 
-/* ------------------------------------------------------------------------- */
-/* filter_video：核心逻辑 */
+	if (filter->output_texture)
+		gs_texture_destroy(filter->output_texture);
 
-static struct obs_source_frame *filter_video(void *data,
-                                             struct obs_source_frame *frame)
-{
-    struct my_filter_data *f = data;
-    if (!f || !frame)
-        return frame;
+	if (filter->roi_texture)
+		gs_texture_destroy(filter->roi_texture);
 
-    f->frame_count++;
+	if (filter->roi_data_cpu)
+		bfree(filter->roi_data_cpu);
 
-    bool roi_ok = false;
+	if (filter->effect)
+		gs_effect_destroy(filter->effect);
 
-    if (frame->format == VIDEO_FORMAT_NV12) {
+	if (g_filter_data == filter)
+		g_filter_data = NULL;
 
-        /* 阶段 1：画框 */
-        draw_center_box_nv12(frame, f->roi_w, f->roi_h);
-
-        /* 阶段 2：提取 ROI */
-        if (f->roi_rgb)
-            roi_ok = extract_center_roi_rgb(frame, f->roi_w, f->roi_h, f->roi_rgb);
-    }
-
-    /* 阶段 3：日志 */
-    if (f->frame_count % 300 == 0) {
-        obs_log(LOG_INFO,
-            "[MYFILTER] frame=%llu | %ux%u | fmt=%d | ROI=%s",
-            (unsigned long long)f->frame_count,
-            frame->width, frame->height,
-            frame->format,
-            roi_ok ? "OK" : "FAIL");
-    }
-
-    return frame;
-}
-
-/* ------------------------------------------------------------------------- */
-/* properties / update */
-
-static obs_properties_t *filter_properties(void *data)
-{
-    UNUSED_PARAMETER(data);
-    return obs_properties_create();
+	bfree(filter);
+	obs_log(LOG_INFO, "Filter destroyed");
 }
 
 static void filter_update(void *data, obs_data_t *settings)
 {
-    UNUSED_PARAMETER(data);
-    UNUSED_PARAMETER(settings);
+	UNUSED_PARAMETER(data);
+	UNUSED_PARAMETER(settings);
 }
 
-/* ------------------------------------------------------------------------- */
-/* 滤镜类型定义 */
+static obs_properties_t *filter_properties(void *unused)
+{
+	UNUSED_PARAMETER(unused);
+	return obs_properties_create();
+}
+
+static void filter_video_render(void *data, gs_effect_t *effect)
+{
+	UNUSED_PARAMETER(effect);
+	UNUSED_PARAMETER(data);
+}
+
+static struct gs_texture *get_nv12_plane(gs_texture_t *tex, uint32_t plane)
+{
+	if (!tex)
+		return NULL;
+
+	enum gs_color_format format = gs_texture_get_color_format(tex);
+
+	if (format == GS_NV12) {
+		return gs_texture_get_plane(tex, plane);
+	}
+
+	return tex;
+}
+
+static void update_textures(my_filter_data_t *filter, uint32_t width, uint32_t height)
+{
+	if (filter->width != width || filter->height != height ||
+	    !filter->output_texture || !filter->roi_texture) {
+
+		if (filter->output_texture)
+			gs_texture_destroy(filter->output_texture);
+
+		if (filter->roi_texture)
+			gs_texture_destroy(filter->roi_texture);
+
+		filter->output_texture = gs_texture_create(
+			width, height, GS_RGBA, 1, NULL, GS_DYNAMIC);
+
+		filter->roi_texture = gs_texture_create(
+			ROI_SIZE, ROI_SIZE, GS_RGBA, 1, NULL, GS_DYNAMIC);
+
+		pthread_mutex_lock(&filter->roi_mutex);
+		if (filter->roi_data_cpu)
+			bfree(filter->roi_data_cpu);
+		filter->roi_data_cpu = bzalloc(ROI_SIZE * ROI_SIZE * 4);
+		pthread_mutex_unlock(&filter->roi_mutex);
+
+		filter->width = width;
+		filter->height = height;
+
+		obs_log(LOG_INFO, "Textures updated: %ux%u", width, height);
+	}
+}
+
+static void render_with_box(my_filter_data_t *filter, gs_texture_t *tex_y,
+			    gs_texture_t *tex_uv)
+{
+	struct vec4 image_size;
+	vec4_set(&image_size, (float)filter->width, (float)filter->height,
+		 1.0f / (float)filter->width, 1.0f / (float)filter->height);
+
+	struct vec4 roi_size;
+	vec4_set(&roi_size, (float)ROI_SIZE, (float)ROI_SIZE, 0.0f, 0.0f);
+
+	struct vec4 roi_center;
+	vec4_set(&roi_center, (float)filter->width / 2.0f,
+		 (float)filter->height / 2.0f, 0.0f, 0.0f);
+
+	struct vec4 box_color;
+	vec4_set(&box_color, 1.0f, 0.0f, 0.0f, 1.0f);
+
+	gs_effect_set_vec4(filter->param_image_size, &image_size);
+	gs_effect_set_vec4(filter->param_roi_size, &roi_size);
+	gs_effect_set_vec4(filter->param_roi_center, &roi_center);
+	gs_effect_set_vec4(filter->param_box_color, &box_color);
+	gs_effect_set_float(filter->param_box_width, 1.0f);
+
+	gs_technique_begin(filter->tech_normal);
+	gs_technique_begin_pass(filter->tech_normal, 0);
+
+	gs_effect_set_texture(gs_effect_get_param_by_name(filter->effect, "tex_y"),
+			     tex_y);
+	gs_effect_set_texture(gs_effect_get_param_by_name(filter->effect, "tex_uv"),
+			     tex_uv);
+
+	gs_draw_sprite(tex_y, 0, filter->width, filter->height);
+
+	gs_technique_end_pass(filter->tech_normal);
+	gs_technique_end(filter->tech_normal);
+}
+
+static void render_roi_only(my_filter_data_t *filter, gs_texture_t *tex_y,
+			    gs_texture_t *tex_uv)
+{
+	struct vec4 image_size;
+	vec4_set(&image_size, (float)filter->width, (float)filter->height,
+		 1.0f / (float)filter->width, 1.0f / (float)filter->height);
+
+	struct vec4 roi_size;
+	vec4_set(&roi_size, (float)ROI_SIZE, (float)ROI_SIZE, 0.0f, 0.0f);
+
+	struct vec4 roi_center;
+	vec4_set(&roi_center, (float)filter->width / 2.0f,
+		 (float)filter->height / 2.0f, 0.0f, 0.0f);
+
+	gs_effect_set_vec4(filter->param_image_size, &image_size);
+	gs_effect_set_vec4(filter->param_roi_size, &roi_size);
+	gs_effect_set_vec4(filter->param_roi_center, &roi_center);
+
+	gs_technique_begin(filter->tech_roi);
+	gs_technique_begin_pass(filter->tech_roi, 0);
+
+	gs_effect_set_texture(gs_effect_get_param_by_name(filter->effect, "tex_y"),
+			     tex_y);
+	gs_effect_set_texture(gs_effect_get_param_by_name(filter->effect, "tex_uv"),
+			     tex_uv);
+
+	gs_draw_sprite(tex_y, 0, filter->width, filter->height);
+
+	gs_technique_end_pass(filter->tech_roi);
+	gs_technique_end(filter->tech_roi);
+}
+
+static void copy_roi_to_cpu(my_filter_data_t *filter)
+{
+	if (!filter->roi_texture || !filter->roi_data_cpu)
+		return;
+
+	gs_texture_map(filter->roi_texture, NULL);
+
+	pthread_mutex_lock(&filter->roi_mutex);
+
+	if (gs_texture_get_color_format(filter->roi_texture) == GS_RGBA) {
+		gs_texture_get_image(filter->roi_texture, filter->roi_data_cpu,
+				     ROI_SIZE * ROI_SIZE * 4, 0);
+	}
+
+	filter->roi_ready = true;
+
+	pthread_mutex_unlock(&filter->roi_mutex);
+}
+
+static struct gs_texture *filter_video_gpu(void *data, struct gs_texture *tex)
+{
+	my_filter_data_t *filter = data;
+
+	if (!tex || !filter)
+		return tex;
+
+	enum gs_color_format format = gs_texture_get_color_format(tex);
+	uint32_t width = gs_texture_get_width(tex);
+	uint32_t height = gs_texture_get_height(tex);
+
+	update_textures(filter, width, height);
+
+	gs_texture_t *tex_y = get_nv12_plane(tex, 0);
+	gs_texture_t *tex_uv = get_nv12_plane(tex, 1);
+
+	if (!tex_y || !tex_uv) {
+		obs_log(LOG_WARNING, "Failed to get NV12 planes");
+		return tex;
+	}
+
+	gs_set_render_target(filter->output_texture, NULL);
+	gs_ortho(0.0f, (float)width, 0.0f, (float)height, -100.0f, 100.0f);
+
+	render_with_box(filter, tex_y, tex_uv);
+
+	gs_set_render_target(filter->roi_texture, NULL);
+	gs_ortho(0.0f, (float)width, 0.0f, (float)height, -100.0f, 100.0f);
+
+	render_roi_only(filter, tex_y, tex_uv);
+
+	copy_roi_to_cpu(filter);
+
+	filter->frame_count++;
+
+	if (filter->frame_count % 300 == 0) {
+		obs_log(LOG_INFO,
+			"[MYFILTER] filter_video_gpu running | %ux%u | format=%d | GPU=true | ROI=%s",
+			width, height, format,
+			filter->roi_ready ? "ready" : "not ready");
+	}
+
+	gs_set_render_target(NULL, NULL);
+
+	return filter->output_texture;
+}
+
+bool get_center_roi_gpu_uint8(uint8_t **out_data, int *out_w, int *out_h)
+{
+	if (!g_filter_data || !g_filter_data->roi_ready) {
+		return false;
+	}
+
+	pthread_mutex_lock(&g_filter_data->roi_mutex);
+
+	if (g_filter_data->roi_data_cpu) {
+		*out_data = g_filter_data->roi_data_cpu;
+		*out_w = ROI_SIZE;
+		*out_h = ROI_SIZE;
+		pthread_mutex_unlock(&g_filter_data->roi_mutex);
+		return true;
+	}
+
+	pthread_mutex_unlock(&g_filter_data->roi_mutex);
+	return false;
+}
+
+bool get_center_roi_gpu(float **out_data, int *out_w, int *out_h)
+{
+	if (!g_filter_data || !g_filter_data->roi_ready) {
+		return false;
+	}
+
+	pthread_mutex_lock(&g_filter_data->roi_mutex);
+
+	if (g_filter_data->roi_data_cpu) {
+		static float *normalized_data = NULL;
+		static int normalized_size = 0;
+
+		int required_size = ROI_SIZE * ROI_SIZE * 3;
+
+		if (normalized_size < required_size) {
+			if (normalized_data)
+				bfree(normalized_data);
+			normalized_data = bzalloc(required_size * sizeof(float));
+			normalized_size = required_size;
+		}
+
+		for (int i = 0; i < ROI_SIZE * ROI_SIZE; i++) {
+			uint8_t r = g_filter_data->roi_data_cpu[i * 4 + 0];
+			uint8_t g = g_filter_data->roi_data_cpu[i * 4 + 1];
+			uint8_t b = g_filter_data->roi_data_cpu[i * 4 + 2];
+
+			normalized_data[i * 3 + 0] = r / 255.0f;
+			normalized_data[i * 3 + 1] = g / 255.0f;
+			normalized_data[i * 3 + 2] = b / 255.0f;
+		}
+
+		*out_data = normalized_data;
+		*out_w = ROI_SIZE;
+		*out_h = ROI_SIZE;
+
+		pthread_mutex_unlock(&g_filter_data->roi_mutex);
+		return true;
+	}
+
+	pthread_mutex_unlock(&g_filter_data->roi_mutex);
+	return false;
+}
 
 static struct obs_source_info filter_info = {
-    .id = "my_first_obs_filter",
-    .type = OBS_SOURCE_TYPE_FILTER,
-    .output_flags = OBS_SOURCE_VIDEO,
+	.id = "my_first_obs_filter",
+	.type = OBS_SOURCE_TYPE_FILTER,
+	.output_flags = OBS_SOURCE_VIDEO | OBS_SOURCE_CUSTOM_DRAW,
 
-    .get_name = filter_get_name,
-    .create = filter_create,
-    .destroy = filter_destroy,
-    .update = filter_update,
-    .get_properties = filter_properties,
-    .filter_video = filter_video,
+	.get_name = filter_get_name,
+	.create = filter_create,
+	.destroy = filter_destroy,
+	.update = filter_update,
+	.get_properties = filter_properties,
+	.video_render = filter_video_render,
+	.filter_video_gpu = filter_video_gpu,
 };
-
-/* ------------------------------------------------------------------------- */
-/* 模块加载 / 卸载 */
 
 bool obs_module_load(void)
 {
-    obs_register_source(&filter_info);
-    obs_log(LOG_INFO, "plugin loaded successfully (version %s)", PLUGIN_VERSION);
-    return true;
+	obs_register_source(&filter_info);
+	obs_log(LOG_INFO, "plugin loaded successfully (version %s)", PLUGIN_VERSION);
+	return true;
 }
 
 void obs_module_unload(void)
 {
-    obs_log(LOG_INFO, "plugin unloaded");
+	obs_log(LOG_INFO, "plugin unloaded");
 }

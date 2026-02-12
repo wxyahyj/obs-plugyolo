@@ -1,0 +1,187 @@
+// -------------------------------------------------------------------------
+// OBS GPU Filter Shader - Center ROI GPU
+// 功能：处理 NV12 纹理，绘制红色框，提取中心 ROI
+// -------------------------------------------------------------------------
+
+// 输入纹理：NV12 格式
+// Y 平面纹理（亮度）
+Texture2D tex_y : register(t0);
+SamplerState sam_y : register(s0);
+
+// UV 平面纹理（色度，交错 UV）
+Texture2D tex_uv : register(t1);
+SamplerState sam_uv : register(s1);
+
+// -------------------------------------------------------------------------
+// Uniform 参数（从 C 代码传入）
+// -------------------------------------------------------------------------
+
+// 画面尺寸 (width, height, 1.0/width, 1.0/height)
+uniform float4 image_size;
+
+// ROI 尺寸 (roi_width, roi_height, 0, 0)
+uniform float4 roi_size;
+
+// ROI 中心坐标 (center_x, center_y, 0, 0)
+uniform float4 roi_center;
+
+// 红色框颜色 (r, g, b, a) - 红色
+uniform float4 box_color = {1.0, 0.0, 0.0, 1.0};
+
+// 红色框线宽（像素）
+uniform float box_width = 1.0;
+
+// -------------------------------------------------------------------------
+// 顶点着色器
+// -------------------------------------------------------------------------
+
+struct VertexData {
+	float4 pos : POSITION;
+	float2 uv : TEXCOORD0;
+};
+
+VertexData VSDefault(VertexData input)
+{
+	VertexData output;
+	output.pos = input.pos;
+	output.uv = input.uv;
+	return output;
+}
+
+// -------------------------------------------------------------------------
+// NV12 → RGB 转换函数（BT.601 标准）
+// 公式：
+//   R = Y + 1.402 * (V - 128)
+//   G = Y - 0.34414 * (U - 128) - 0.71414 * (V - 128)
+//   B = Y + 1.772 * (U - 128)
+// 其中 U 和 V 从 UV 纹理中交错读取
+// -------------------------------------------------------------------------
+
+float3 NV12ToRGB(float y, float u, float v)
+{
+	// 将 YUV 转换为 0-1 范围
+	float Y = y / 255.0;
+	float U = (u - 128.0) / 255.0;
+	float V = (v - 128.0) / 255.0;
+
+	// BT.601 转换矩阵
+	float R = Y + 1.402 * V;
+	float G = Y - 0.34414 * U - 0.71414 * V;
+	float B = Y + 1.772 * U;
+
+	return float3(R, G, B);
+}
+
+// -------------------------------------------------------------------------
+// 像素着色器 - 正常渲染 + 绘制红色框
+// 功能：将 NV12 转换为 RGB，并在画面中央绘制 320x320 红色线框
+// -------------------------------------------------------------------------
+
+float4 PSNormal(VertexData input) : TARGET
+{
+	// 获取当前像素坐标（像素空间）
+	float2 pixel_pos = input.uv * image_size.xy;
+
+	// 采样 Y 平面
+	float y = tex_y.Sample(sam_y, input.uv).r * 255.0;
+
+	// 采样 UV 平面（交错 UV）
+	float2 uv_data = tex_uv.Sample(sam_uv, input.uv).rg * 255.0;
+	float u = uv_data.r;
+	float v = uv_data.g;
+
+	// NV12 → RGB 转换
+	float3 rgb = NV12ToRGB(y, u, v);
+
+	// -------------------------------------------------------------------------
+	// 计算红色框区域
+	// 框的中心是 roi_center，尺寸是 roi_size
+	// 框的左上角：roi_center - roi_size / 2
+	// 框的右下角：roi_center + roi_size / 2
+	// -------------------------------------------------------------------------
+
+	float2 box_min = roi_center.xy - roi_size.xy * 0.5;
+	float2 box_max = roi_center.xy + roi_size.xy * 0.5;
+
+	// 判断当前像素是否在红色框的边缘
+	bool on_left_edge = (abs(pixel_pos.x - box_min.x) < box_width) &&
+	                    (pixel_pos.y >= box_min.y && pixel_pos.y <= box_max.y);
+	bool on_right_edge = (abs(pixel_pos.x - box_max.x) < box_width) &&
+	                     (pixel_pos.y >= box_min.y && pixel_pos.y <= box_max.y);
+	bool on_top_edge = (abs(pixel_pos.y - box_min.y) < box_width) &&
+	                   (pixel_pos.x >= box_min.x && pixel_pos.x <= box_max.x);
+	bool on_bottom_edge = (abs(pixel_pos.y - box_max.y) < box_width) &&
+	                      (pixel_pos.x >= box_min.x && pixel_pos.x <= box_max.x);
+
+	// 如果在框的边缘，使用红色
+	if (on_left_edge || on_right_edge || on_top_edge || on_bottom_edge) {
+		return box_color;
+	}
+
+	// 否则返回原始 RGB
+	return float4(rgb, 1.0);
+}
+
+// -------------------------------------------------------------------------
+// 像素着色器 - 只输出中心 ROI（用于 YOLO）
+// 功能：只渲染中心 320x320 区域，输出为 RGB
+// 如果当前像素不在 ROI 区域内，返回黑色
+// -------------------------------------------------------------------------
+
+float4 PSROI(VertexData input) : TARGET
+{
+	// 获取当前像素坐标（像素空间）
+	float2 pixel_pos = input.uv * image_size.xy;
+
+	// 计算 ROI 边界
+	float2 box_min = roi_center.xy - roi_size.xy * 0.5;
+	float2 box_max = roi_center.xy + roi_size.xy * 0.5;
+
+	// 判断当前像素是否在 ROI 区域内
+	bool in_roi = (pixel_pos.x >= box_min.x && pixel_pos.x <= box_max.x) &&
+	              (pixel_pos.y >= box_min.y && pixel_pos.y <= box_max.y);
+
+	// 如果不在 ROI 区域内，返回黑色
+	if (!in_roi) {
+		return float4(0.0, 0.0, 0.0, 1.0);
+	}
+
+	// 采样 Y 平面
+	float y = tex_y.Sample(sam_y, input.uv).r * 255.0;
+
+	// 采样 UV 平面
+	float2 uv_data = tex_uv.Sample(sam_uv, input.uv).rg * 255.0;
+	float u = uv_data.r;
+	float v = uv_data.g;
+
+	// NV12 → RGB 转换
+	float3 rgb = NV12ToRGB(y, u, v);
+
+	return float4(rgb, 1.0);
+}
+
+// -------------------------------------------------------------------------
+// Technique：正常渲染 + 绘制红色框
+// 使用场景：输出到 OBS 显示，用户可以看到带红框的画面
+// -------------------------------------------------------------------------
+technique NormalRender
+{
+	pass
+	{
+		vertex_shader = VSDefault(input);
+		pixel_shader = PSNormal(input);
+	}
+}
+
+// -------------------------------------------------------------------------
+// Technique：只输出中心 ROI
+// 使用场景：提取 ROI 数据用于 YOLO 推理
+// -------------------------------------------------------------------------
+technique ROIRender
+{
+	pass
+	{
+		vertex_shader = VSDefault(input);
+		pixel_shader = PSROI(input);
+	}
+}

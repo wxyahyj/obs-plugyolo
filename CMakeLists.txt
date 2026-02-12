@@ -37,3 +37,5 @@ endif()
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/plugin-main.c)
 
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})
+
+install(FILES data/center_roi_gpu.effect DESTINATION ${CMAKE_INSTALL_PREFIX}/data/obs-plugins/${_name})
