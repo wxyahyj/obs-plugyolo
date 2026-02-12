@@ -42,7 +42,7 @@ typedef struct {
 	uint32_t height;
 
 	int frame_count;
-	os_mutex_t roi_mutex;
+	pthread_mutex_t roi_mutex;
 	bool roi_ready;
 } my_filter_data_t;
 
@@ -64,12 +64,12 @@ static void *filter_create(obs_data_t *settings, obs_source_t *source)
 	data->roi_ready = false;
 	data->roi_buffer = NULL;
 	data->roi_texture = NULL;
-	os_mutex_init(&data->roi_mutex);
+	pthread_mutex_init(&data->roi_mutex, NULL);
 
 	char *effect_path = obs_module_file("center_roi_gpu.effect");
 	if (!effect_path) {
 		obs_log(LOG_ERROR, "Failed to find center_roi_gpu.effect");
-		os_mutex_destroy(&data->roi_mutex);
+		pthread_mutex_destroy(&data->roi_mutex);
 		bfree(data);
 		return NULL;
 	}
@@ -79,7 +79,7 @@ static void *filter_create(obs_data_t *settings, obs_source_t *source)
 
 	if (!data->effect) {
 		obs_log(LOG_ERROR, "Failed to create effect from center_roi_gpu.effect");
-		os_mutex_destroy(&data->roi_mutex);
+		pthread_mutex_destroy(&data->roi_mutex);
 		bfree(data);
 		return NULL;
 	}
@@ -95,7 +95,7 @@ static void *filter_create(obs_data_t *settings, obs_source_t *source)
 	if (!data->tech_normal) {
 		obs_log(LOG_ERROR, "Failed to get NormalRender technique from effect");
 		gs_effect_destroy(data->effect);
-		os_mutex_destroy(&data->roi_mutex);
+		pthread_mutex_destroy(&data->roi_mutex);
 		bfree(data);
 		return NULL;
 	}
@@ -113,7 +113,7 @@ static void filter_destroy(void *data)
 	if (!filter)
 		return;
 
-	os_mutex_destroy(&filter->roi_mutex);
+	pthread_mutex_destroy(&filter->roi_mutex);
 
 	if (filter->roi_texture)
 		gs_texture_destroy(filter->roi_texture);
@@ -157,12 +157,12 @@ static void update_roi_texture(my_filter_data_t *filter, uint32_t width, uint32_
 
 		filter->roi_texture = gs_texture_create(ROI_SIZE, ROI_SIZE, GS_RGBA, 1, NULL, GS_DYNAMIC);
 
-		os_mutex_lock(&filter->roi_mutex);
+		pthread_mutex_lock(&filter->roi_mutex);
 		if (filter->roi_buffer)
 			bfree(filter->roi_buffer);
 		filter->roi_buffer = bzalloc(ROI_SIZE * ROI_SIZE * 4);
 		filter->roi_ready = false;
-		os_mutex_unlock(&filter->roi_mutex);
+		pthread_mutex_unlock(&filter->roi_mutex);
 
 		filter->width = width;
 		filter->height = height;
@@ -214,7 +214,7 @@ static void copy_roi_to_cpu(my_filter_data_t *filter)
 	uint32_t linesize;
 
 	if (gs_texture_map(filter->roi_texture, &data, &linesize, 0)) {
-		os_mutex_lock(&filter->roi_mutex);
+		pthread_mutex_lock(&filter->roi_mutex);
 
 		for (int y = 0; y < ROI_SIZE; y++) {
 			uint8_t *src = data + y * linesize;
@@ -224,7 +224,7 @@ static void copy_roi_to_cpu(my_filter_data_t *filter)
 
 		filter->roi_ready = true;
 
-		os_mutex_unlock(&filter->roi_mutex);
+		pthread_mutex_unlock(&filter->roi_mutex);
 
 		gs_texture_unmap(filter->roi_texture);
 	}
@@ -307,17 +307,17 @@ bool get_center_roi(uint8_t **out_data, int *out_w, int *out_h)
 		return false;
 	}
 
-	os_mutex_lock(&g_filter_data->roi_mutex);
+	pthread_mutex_lock(&g_filter_data->roi_mutex);
 
 	if (g_filter_data->roi_buffer) {
 		*out_data = g_filter_data->roi_buffer;
 		*out_w = ROI_SIZE;
 		*out_h = ROI_SIZE;
-		os_mutex_unlock(&g_filter_data->roi_mutex);
+		pthread_mutex_unlock(&g_filter_data->roi_mutex);
 		return true;
 	}
 
-	os_mutex_unlock(&g_filter_data->roi_mutex);
+	pthread_mutex_unlock(&g_filter_data->roi_mutex);
 	return false;
 }
 
