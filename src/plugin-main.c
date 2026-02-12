@@ -213,7 +213,7 @@ static void copy_roi_to_cpu(my_filter_data_t *filter)
 	uint8_t *data;
 	uint32_t linesize;
 
-	if (gs_texture_map(filter->roi_texture, &data, &linesize, 0)) {
+	if (gs_texture_map(filter->roi_texture, &data, &linesize)) {
 		pthread_mutex_lock(&filter->roi_mutex);
 
 		for (int y = 0; y < ROI_SIZE; y++) {
@@ -252,10 +252,6 @@ static void video_render(void *data, gs_effect_t *effect)
 	if (!obs_source_process_filter_begin(filter->context, GS_RGBA, OBS_ALLOW_DIRECT_RENDERING))
 		return;
 
-	gs_texture_t *source_texture = obs_source_get_texture(target);
-	if (!source_texture)
-		return;
-
 	struct vec4 image_size;
 	vec4_set(&image_size, (float)width, (float)height,
 		 1.0f / (float)width, 1.0f / (float)height);
@@ -278,18 +274,18 @@ static void video_render(void *data, gs_effect_t *effect)
 	gs_technique_begin(filter->tech_normal);
 	gs_technique_begin_pass(filter->tech_normal, 0);
 
-	gs_effect_set_texture(gs_effect_get_param_by_name(filter->effect, "tex_y"), source_texture);
-	gs_effect_set_texture(gs_effect_get_param_by_name(filter->effect, "tex_uv"), source_texture);
-
-	gs_draw_sprite(source_texture, 0, width, height);
+	gs_draw_sprite(NULL, 0, width, height);
 
 	gs_technique_end_pass(filter->tech_normal);
 	gs_technique_end(filter->tech_normal);
 
-	render_roi_to_texture(filter, source_texture);
-	copy_roi_to_cpu(filter);
+	obs_source_process_filter_end(filter->context, effect);
 
-	obs_source_process_filter_end(filter->context, 0, 0, width, height);
+	gs_texture_t *source_texture = obs_filter_get_target_effect(filter->context);
+	if (source_texture) {
+		render_roi_to_texture(filter, source_texture);
+		copy_roi_to_cpu(filter);
+	}
 
 	filter->frame_count++;
 
