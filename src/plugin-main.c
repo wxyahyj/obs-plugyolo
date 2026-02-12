@@ -281,10 +281,13 @@ static void video_render(void *data, gs_effect_t *effect)
 
 	obs_source_process_filter_end(filter->context, effect);
 
-	gs_texture_t *source_texture = obs_filter_get_target_effect(filter->context);
-	if (source_texture) {
-		render_roi_to_texture(filter, source_texture);
-		copy_roi_to_cpu(filter);
+	gs_texrender_t *texrender = obs_filter_get_texrender(filter->context);
+	if (texrender) {
+		gs_texture_t *source_texture = gs_texrender_get_texture(texrender);
+		if (source_texture) {
+			render_roi_to_texture(filter, source_texture);
+			copy_roi_to_cpu(filter);
+		}
 	}
 
 	filter->frame_count++;
