@@ -45,7 +45,18 @@ static struct obs_source_frame *filter_video(
 {
 	UNUSED_PARAMETER(data);
 
-	/* 这里以后就是你加 YOLO / 跟踪 / 逻辑 的地方 */
+	static int cnt = 0;
+	cnt++;
+
+	/* 每 300 帧打一次日志，避免刷屏 */
+	if(cnt % 300 == 0) {
+		obs_log(LOG_INFO,
+			"[MYFILTER] filter_video running | %ux%u | format=%d",
+			frame ? frame->width : 0,
+			frame ? frame->height : 0,
+			frame ? frame->format : -1);
+	}
+
 	return frame;
 }
 
