@@ -27,6 +27,7 @@ OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE("my_first_obs_filter", "en-US")
 
 #define ROI_SIZE 320
+#define ROI_CHANNELS 3 // RGB
 
 typedef struct {
 	obs_source_t *context;
@@ -146,9 +147,164 @@ static obs_properties_t *filter_properties(void *unused)
 	return obs_properties_create();
 }
 
+// NV12 格式说明：
+// - Y 分量：width * height 字节
+// - UV 分量：(width/2) * (height/2) * 2 字节（交错存储）
+// - 总大小：width * height * 3/2 字节
+
+// 在 NV12 格式上绘制矩形框（只修改 Y 分量，显示为白色框）
+static void draw_rectangle_nv12(uint8_t *data, int width, int height, int x, int y, int w, int h, int line_width)
+{
+	// 计算 ROI 边界
+	int x1 = x;
+	int y1 = y;
+	int x2 = x + w - 1;
+	int y2 = y + h - 1;
+
+	// 确保边界在有效范围内
+	x1 = (x1 < 0) ? 0 : x1;
+	y1 = (y1 < 0) ? 0 : y1;
+	x2 = (x2 >= width) ? width - 1 : x2;
+	y2 = (y2 >= height) ? height - 1 : y2;
+
+	// 绘制上下边框
+	for (int i = x1; i <= x2; i++) {
+		// 上边框
+		for (int j = y1; j < y1 + line_width && j < height; j++) {
+			int index = j * width + i;
+			data[index] = 255; // 设置为白色
+		}
+		// 下边框
+		for (int j = y2 - line_width + 1; j <= y2 && j >= 0; j++) {
+			int index = j * width + i;
+			data[index] = 255; // 设置为白色
+		}
+	}
+
+	// 绘制左右边框
+	for (int j = y1; j <= y2; j++) {
+		// 左边框
+		for (int i = x1; i < x1 + line_width && i < width; i++) {
+			int index = j * width + i;
+			data[index] = 255; // 设置为白色
+		}
+		// 右边框
+		for (int i = x2 - line_width + 1; i <= x2 && i >= 0; i++) {
+			int index = j * width + i;
+			data[index] = 255; // 设置为白色
+		}
+	}
+}
+
+// YUV 转 RGB 函数
+static void yuv_to_rgb(uint8_t y, uint8_t u, uint8_t v, uint8_t *r, uint8_t *g, uint8_t *b)
+{
+	int y_val = y - 16;
+	int u_val = u - 128;
+	int v_val = v - 128;
+
+	int r_val = (298 * y_val + 409 * v_val + 128) >> 8;
+	int g_val = (298 * y_val - 100 * u_val - 208 * v_val + 128) >> 8;
+	int b_val = (298 * y_val + 516 * u_val + 128) >> 8;
+
+	//  clamp to 0-255
+	r_val = (r_val < 0) ? 0 : (r_val > 255) ? 255 : r_val;
+	g_val = (g_val < 0) ? 0 : (g_val > 255) ? 255 : g_val;
+	b_val = (b_val < 0) ? 0 : (b_val > 255) ? 255 : b_val;
+
+	*r = (uint8_t)r_val;
+	*g = (uint8_t)g_val;
+	*b = (uint8_t)b_val;
+}
+
+// 从 NV12 帧中提取中心 ROI 区域（转换为 RGB 格式）
+static bool extract_center_roi(struct obs_source_frame *frame, int roi_width, int roi_height, uint8_t *out_buffer)
+{
+	if (!frame || !out_buffer) {
+		return false;
+	}
+
+	int width = frame->width;
+	int height = frame->height;
+	uint8_t *data = frame->data[0];
+	uint8_t *uv_data = frame->data[1];
+
+	// 计算 ROI 中心位置
+	int roi_x = (width - roi_width) / 2;
+	int roi_y = (height - roi_height) / 2;
+
+	// 确保 ROI 在有效范围内
+	if (roi_x < 0 || roi_y < 0 || roi_x + roi_width > width || roi_y + roi_height > height) {
+		return false;
+	}
+
+	// 提取 ROI 数据并转换为 RGB
+	int rgb_index = 0;
+	for (int y = roi_y; y < roi_y + roi_height; y++) {
+		for (int x = roi_x; x < roi_x + roi_width; x++) {
+			// 获取 Y 分量
+			int y_index = y * width + x;
+			uint8_t y_val = data[y_index];
+
+			// 获取 UV 分量（NV12 格式中 UV 分量是交错存储的，每四个 Y 像素共享一个 UV 值）
+			int uv_x = x / 2;
+			int uv_y = y / 2;
+			int uv_index = uv_y * (width / 2) * 2 + uv_x * 2;
+			uint8_t u_val = uv_data[uv_index];
+			uint8_t v_val = uv_data[uv_index + 1];
+
+			// 转换为 RGB
+			uint8_t r, g, b;
+			yuv_to_rgb(y_val, u_val, v_val, &r, &g, &b);
+
+			// 存储到输出缓冲区（RGB 格式）
+			out_buffer[rgb_index++] = r;
+			out_buffer[rgb_index++] = g;
+			out_buffer[rgb_index++] = b;
+		}
+	}
+
+	return true;
+}
+
 static struct obs_source_frame *filter_video(void *data, struct obs_source_frame *frame)
 {
-	UNUSED_PARAMETER(data);
+	if (!data || !frame) {
+		return frame;
+	}
+
+	my_filter_data_t *filter = data;
+	filter->frame_count++;
+
+	// 计算画面中心和 ROI 位置
+	int width = frame->width;
+	int height = frame->height;
+	int roi_x = (width - ROI_SIZE) / 2;
+	int roi_y = (height - ROI_SIZE) / 2;
+
+	// 阶段 1：在画面中央绘制 320x320 的检测区域框
+	// 注意：直接在 NV12 格式上绘制彩色框比较复杂，这里只修改 Y 分量绘制白色框
+	draw_rectangle_nv12(frame->data[0], width, height, roi_x, roi_y, ROI_SIZE, ROI_SIZE, 2);
+
+	// 阶段 2：提取中心 ROI 区域
+	bool roi_extracted = false;
+	if (filter->roi_buffer) {
+		roi_extracted = extract_center_roi(frame, ROI_SIZE, ROI_SIZE, filter->roi_buffer);
+		pthread_mutex_lock(&filter->roi_mutex);
+		filter->roi_ready = roi_extracted;
+		pthread_mutex_unlock(&filter->roi_mutex);
+	}
+
+	// 阶段 3：每 300 帧输出一次日志
+	if (filter->frame_count % 300 == 0) {
+		obs_log(LOG_INFO,
+			"[MYFILTER] Filter video | Frame: %d | Size: %dx%d | Format: %s | ROI extracted: %s",
+			filter->frame_count,
+			width, height,
+			"NV12",
+			roi_extracted ? "Yes" : "No");
+	}
+
 	return frame;
 }
 
@@ -163,7 +319,7 @@ static void update_roi_texture(my_filter_data_t *filter, uint32_t width, uint32_
 		pthread_mutex_lock(&filter->roi_mutex);
 		if (filter->roi_buffer)
 			bfree(filter->roi_buffer);
-		filter->roi_buffer = bzalloc(ROI_SIZE * ROI_SIZE * 4);
+		filter->roi_buffer = bzalloc(ROI_SIZE * ROI_SIZE * ROI_CHANNELS); // RGB 格式
 		filter->roi_ready = false;
 		pthread_mutex_unlock(&filter->roi_mutex);
 
@@ -176,7 +332,7 @@ static void update_roi_texture(my_filter_data_t *filter, uint32_t width, uint32_
 
 static void render_roi_to_texture(my_filter_data_t *filter, gs_texture_t *source_texture)
 {
-	if (!filter->roi_texture || !source_texture)
+	if (!filter->roi_texture || !source_texture) 
 		return;
 
 	gs_set_render_target(filter->roi_texture, NULL);
@@ -210,7 +366,7 @@ static void render_roi_to_texture(my_filter_data_t *filter, gs_texture_t *source
 
 static void copy_roi_to_cpu(my_filter_data_t *filter)
 {
-	if (!filter->roi_texture || !filter->roi_buffer)
+	if (!filter->roi_texture || !filter->roi_buffer) 
 		return;
 
 	uint8_t *data;
@@ -221,8 +377,13 @@ static void copy_roi_to_cpu(my_filter_data_t *filter)
 
 		for (int y = 0; y < ROI_SIZE; y++) {
 			uint8_t *src = data + y * linesize;
-			uint8_t *dst = filter->roi_buffer + y * ROI_SIZE * 4;
-			memcpy(dst, src, ROI_SIZE * 4);
+			uint8_t *dst = filter->roi_buffer + y * ROI_SIZE * ROI_CHANNELS;
+			// 转换 RGBA 到 RGB
+			for (int x = 0; x < ROI_SIZE; x++) {
+				dst[x * 3 + 0] = src[x * 4 + 0]; // R
+				dst[x * 3 + 1] = src[x * 4 + 1]; // G
+				dst[x * 3 + 2] = src[x * 4 + 2]; // B
+			}
 		}
 
 		filter->roi_ready = true;
@@ -237,22 +398,22 @@ static void video_render(void *data, gs_effect_t *effect)
 {
 	my_filter_data_t *filter = data;
 
-	if (!filter)
+	if (!filter) 
 		return;
 
 	obs_source_t *target = obs_filter_get_target(filter->context);
-	if (!target)
+	if (!target) 
 		return;
 
 	uint32_t width = obs_source_get_base_width(target);
 	uint32_t height = obs_source_get_base_height(target);
 
-	if (width == 0 || height == 0)
+	if (width == 0 || height == 0) 
 		return;
 
 	update_roi_texture(filter, width, height);
 
-	if (!obs_source_process_filter_begin(filter->context, GS_RGBA, OBS_ALLOW_DIRECT_RENDERING))
+	if (!obs_source_process_filter_begin(filter->context, GS_RGBA, OBS_ALLOW_DIRECT_RENDERING)) 
 		return;
 
 	struct vec4 image_size;
@@ -296,9 +457,9 @@ static void video_render(void *data, gs_effect_t *effect)
 
 	if (filter->frame_count % 300 == 0) {
 		obs_log(LOG_INFO,
-			"[MYFILTER] video_render running | %ux%u | GPU=true | ROI=%s",
+			"[MYFILTER] Video render | Size: %dx%d | ROI ready: %s",
 			width, height,
-			filter->roi_ready ? "ready" : "not ready");
+			filter->roi_ready ? "Yes" : "No");
 	}
 }
 
@@ -339,11 +500,11 @@ static struct obs_source_info filter_info = {
 bool obs_module_load(void)
 {
 	obs_register_source(&filter_info);
-	obs_log(LOG_INFO, "plugin loaded successfully (version %s)", PLUGIN_VERSION);
+	obs_log(LOG_INFO, "Plugin loaded successfully (version %s)", PLUGIN_VERSION);
 	return true;
 }
 
 void obs_module_unload(void)
 {
-	obs_log(LOG_INFO, "plugin unloaded");
+	obs_log(LOG_INFO, "Plugin unloaded");
 }
