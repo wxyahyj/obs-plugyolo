@@ -23,6 +23,9 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <util/threading.h>
 #include <util/platform.h>
 
+OBS_DECLARE_MODULE()
+OBS_MODULE_USE_DEFAULT_LOCALE("my_first_obs_filter", "en-US")
+
 #define ROI_SIZE 320
 
 typedef struct {
