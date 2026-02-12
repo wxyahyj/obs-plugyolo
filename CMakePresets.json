@@ -44,7 +44,7 @@
         "CMAKE_COMPILE_WARNING_AS_ERROR": true,
         "ENABLE_CCACHE": true
       }
-    },,
+    },
     {
       "name": "windows-x64",
       "displayName": "Windows x64",
