@@ -1,22 +1,11 @@
 uniform float4x4 ViewProj;
-
-uniform texture2d image;
+sampler2D image;
 
 uniform float4 image_size;
-
 uniform float4 roi_size;
-
 uniform float4 roi_center;
-
-uniform float4 box_color = {1.0, 0.0, 0.0, 1.0};
-
-uniform float box_width = 1.0;
-
-sampler_state LinearClamp {
-    Filter   = Linear;
-    AddressU = Clamp;
-    AddressV = Clamp;
-};
+uniform float4 box_color;
+uniform float  box_width;
 
 struct VertData {
     float4 pos : POSITION;
@@ -34,49 +23,49 @@ VertData DefaultVS(VertData v_in)
 float4 PSNormal(VertData v_in) : TARGET
 {
     float2 pixel_pos = v_in.uv * image_size.xy;
-    float4 color = image.Sample(LinearClamp, v_in.uv);
+    float4 color = tex2D(image, v_in.uv);
 
     float2 box_min = roi_center.xy - roi_size.xy * 0.5;
     float2 box_max = roi_center.xy + roi_size.xy * 0.5;
 
-    bool on_left_edge = (abs(pixel_pos.x - box_min.x) < box_width) &&
-                        (pixel_pos.y >= box_min.y && pixel_pos.y <= box_max.y);
-    bool on_right_edge = (abs(pixel_pos.x - box_max.x) < box_width) &&
-                         (pixel_pos.y >= box_min.y && pixel_pos.y <= box_max.y);
-    bool on_top_edge = (abs(pixel_pos.y - box_min.y) < box_width) &&
-                       (pixel_pos.x >= box_min.x && pixel_pos.x <= box_max.x);
-    bool on_bottom_edge = (abs(pixel_pos.y - box_max.y) < box_width) &&
-                          (pixel_pos.x >= box_min.x && pixel_pos.x <= box_max.x);
+    float on_left   = step(abs(pixel_pos.x - box_min.x), box_width)
+                      * step(box_min.y, pixel_pos.y) * step(pixel_pos.y, box_max.y);
 
-    if (on_left_edge || on_right_edge || on_top_edge || on_bottom_edge) {
-        return box_color;
-    }
+    float on_right  = step(abs(pixel_pos.x - box_max.x), box_width)
+                      * step(box_min.y, pixel_pos.y) * step(pixel_pos.y, box_max.y);
 
-    return color;
+    float on_top    = step(abs(pixel_pos.y - box_min.y), box_width)
+                      * step(box_min.x, pixel_pos.x) * step(pixel_pos.x, box_max.x);
+
+    float on_bottom = step(abs(pixel_pos.y - box_max.y), box_width)
+                      * step(box_min.x, pixel_pos.x) * step(pixel_pos.x, box_max.x);
+
+    float is_edge = saturate(on_left + on_right + on_top + on_bottom);
+
+    return lerp(color, box_color, is_edge);
 }
 
 float4 PSROI(VertData v_in) : TARGET
 {
     float2 pixel_pos = v_in.uv * image_size.xy;
+
     float2 box_min = roi_center.xy - roi_size.xy * 0.5;
     float2 box_max = roi_center.xy + roi_size.xy * 0.5;
 
-    bool in_roi = (pixel_pos.x >= box_min.x && pixel_pos.x <= box_max.x) &&
-                  (pixel_pos.y >= box_min.y && pixel_pos.y <= box_max.y);
+    float in_roi = step(box_min.x, pixel_pos.x) * step(pixel_pos.x, box_max.x)
+                 * step(box_min.y, pixel_pos.y) * step(pixel_pos.y, box_max.y);
 
-    if (!in_roi) {
-        return float4(0.0, 0.0, 0.0, 1.0);
-    }
+    float4 color = tex2D(image, v_in.uv);
 
-    return image.Sample(LinearClamp, v_in.uv);
+    return lerp(float4(0,0,0,1), color, in_roi);
 }
 
 technique NormalRender
 {
     pass
     {
-        vertex_shader = DefaultVS(v_in);
-        pixel_shader  = PSNormal(v_in);
+        vertex_shader = DefaultVS(ViewProj);
+        pixel_shader  = PSNormal;
     }
 }
 
@@ -84,7 +73,7 @@ technique ROIRender
 {
     pass
     {
-        vertex_shader = DefaultVS(v_in);
-        pixel_shader  = PSROI(v_in);
+        vertex_shader = DefaultVS(ViewProj);
+        pixel_shader  = PSROI;
     }
 }
