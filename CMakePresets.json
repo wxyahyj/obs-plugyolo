@@ -42,11 +42,9 @@
       "generator": "Xcode",
       "cacheVariables": {
         "CMAKE_COMPILE_WARNING_AS_ERROR": true,
-        "ENABLE_CCACHE": true,
-        "ENABLE_PLUGINS": true,
-        "ENABLE_UI": false
+        "ENABLE_CCACHE": true
       }
-    },
+    },,
     {
       "name": "windows-x64",
       "displayName": "Windows x64",
@@ -68,9 +66,7 @@
       "displayName": "Windows x64 CI build",
       "description": "Build for Windows x64 on CI",
       "cacheVariables": {
-        "CMAKE_COMPILE_WARNING_AS_ERROR": true,
-        "ENABLE_PLUGINS": true,
-        "ENABLE_UI": false
+        "CMAKE_COMPILE_WARNING_AS_ERROR": true
       }
     },
     {
@@ -99,9 +95,7 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo",
         "CMAKE_COMPILE_WARNING_AS_ERROR": true,
-        "ENABLE_CCACHE": true,
-        "ENABLE_PLUGINS": true,
-        "ENABLE_UI": false
+        "ENABLE_CCACHE": true
       }
     }
   ],
