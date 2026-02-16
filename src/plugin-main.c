@@ -23,13 +23,27 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <util/threading.h>
 #include <util/platform.h>
 
-// ONNX Runtime
+// 条件编译：只有在有 ONNX Runtime 时才包含相关头文件
+#ifdef HAVE_ONNX
 #include <onnxruntime_cxx_api.h>
+#endif
 
-// OpenCV
+// 条件编译：只有在有 OpenCV 时才包含相关头文件
+#ifdef HAVE_OPENCV
 #include <opencv2/opencv.hpp>
 #include <opencv2/core/core.hpp>
 #include <opencv2/imgproc/imgproc.hpp>
+#endif
+
+// 条件编译：如果没有推理支持，定义一个空的检测结果结构体
+#ifndef NO_INFERENCE
+// 检测结果结构体
+typedef struct {
+	float x1, y1, x2, y2; // 边界框坐标
+	float confidence;     // 置信度
+	int class_id;         // 类别 ID
+} detection_result_t;
+#endif
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE("my_first_obs_filter", "en-US")
@@ -57,6 +71,8 @@ typedef struct {
 	pthread_mutex_t roi_mutex;
 	bool roi_ready;
 
+	// 条件编译：只有在有 ONNX Runtime 时才包含相关成员
+#ifndef NO_INFERENCE
 	// ONNX Runtime
 	Ort::Env *ort_env;
 	Ort::Session *ort_session;
@@ -89,6 +105,7 @@ typedef struct {
 	bool inference_buffer_ready;
 	std::vector<detection_result_t> pending_detections;
 	bool pending_detections_ready;
+#endif
 } my_filter_data_t;
 
 static my_filter_data_t *g_filter_data = NULL;
@@ -110,6 +127,9 @@ static void *filter_create(obs_data_t *settings, obs_source_t *source)
 	data->roi_buffer = NULL;
 	data->roi_texture = NULL;
 	pthread_mutex_init(&data->roi_mutex, NULL);
+
+#ifndef NO_INFERENCE
+	// 初始化检测结果相关变量
 	pthread_mutex_init(&data->detections_mutex, NULL);
 
 	// 初始化异步推理相关变量
@@ -120,6 +140,7 @@ static void *filter_create(obs_data_t *settings, obs_source_t *source)
 	data->inference_buffer = bzalloc(ROI_SIZE * ROI_SIZE * ROI_CHANNELS);
 	data->inference_buffer_ready = false;
 	data->pending_detections_ready = false;
+#endif
 
 	// 尝试创建 shader effect，但即使失败也继续运行（使用 CPU 模式）
 	char *effect_path = obs_module_file("center_roi_gpu.effect");
@@ -151,6 +172,7 @@ static void *filter_create(obs_data_t *settings, obs_source_t *source)
 	// 分配 ROI 缓冲区
 	data->roi_buffer = bzalloc(ROI_SIZE * ROI_SIZE * ROI_CHANNELS);
 
+#ifndef NO_INFERENCE
 	// 初始化 ONNX Runtime
 	try {
 		data->ort_env = new Ort::Env(ORT_LOGGING_LEVEL_WARNING, "YOLOFilter");
@@ -185,6 +207,11 @@ static void *filter_create(obs_data_t *settings, obs_source_t *source)
 	data->nms_threshold = 0.45f;
 	data->class_names = NULL;
 
+	obs_log(LOG_INFO, "Inference support enabled");
+#else
+	obs_log(LOG_INFO, "Inference support disabled (missing dependencies)");
+#endif
+
 	g_filter_data = data;
 
 	obs_log(LOG_INFO, "Filter created successfully (mode: %s)", data->effect ? "GPU" : "CPU");
@@ -199,6 +226,9 @@ static void filter_destroy(void *data)
 		return;
 
 	pthread_mutex_destroy(&filter->roi_mutex);
+
+#ifndef NO_INFERENCE
+	// 清理检测结果相关资源
 	pthread_mutex_destroy(&filter->detections_mutex);
 
 	// 清理异步推理线程
@@ -216,15 +246,6 @@ static void filter_destroy(void *data)
 
 	pthread_mutex_destroy(&filter->inference_mutex);
 	pthread_cond_destroy(&filter->inference_cond);
-
-	if (filter->roi_texture)
-		gs_texture_destroy(filter->roi_texture);
-
-	if (filter->roi_buffer)
-		bfree(filter->roi_buffer);
-
-	if (filter->effect)
-		gs_effect_destroy(filter->effect);
 
 	// 释放 ONNX Runtime 资源
 	if (filter->ort_session) {
@@ -253,6 +274,16 @@ static void filter_destroy(void *data)
 		bfree(filter->class_names);
 		filter->class_names = NULL;
 	}
+#endif
+
+	if (filter->roi_texture)
+		gs_texture_destroy(filter->roi_texture);
+
+	if (filter->roi_buffer)
+		bfree(filter->roi_buffer);
+
+	if (filter->effect)
+		gs_effect_destroy(filter->effect);
 
 	if (g_filter_data == filter)
 		g_filter_data = NULL;
@@ -261,6 +292,7 @@ static void filter_destroy(void *data)
 	obs_log(LOG_INFO, "Filter destroyed");
 }
 
+#ifndef NO_INFERENCE
 // 加载 YOLO 模型
 static bool load_yolo_model(my_filter_data_t *filter)
 {
@@ -317,6 +349,7 @@ static bool load_yolo_model(my_filter_data_t *filter)
 		return false;
 	}
 }
+#endif
 
 static void filter_update(void *data, obs_data_t *settings)
 {
@@ -324,6 +357,7 @@ static void filter_update(void *data, obs_data_t *settings)
 	if (!filter)
 		return;
 
+#ifndef NO_INFERENCE
 	// 模型路径
 	const char *model_path = obs_data_get_string(settings, "model_path");
 	if (model_path && *model_path) {
@@ -390,6 +424,12 @@ static void filter_update(void *data, obs_data_t *settings)
 		filter->ort_session ? "已加载" : "未加载");
 
 	obs_data_set_string(settings, "model_info", model_info);
+#else
+	// 当没有推理支持时，显示提示信息
+	char model_info[512];
+	snprintf(model_info, sizeof(model_info), "推理功能已禁用（缺少依赖库）\n请安装 ONNX Runtime 和 OpenCV 以启用 YOLO 检测功能");
+	obs_data_set_string(settings, "model_info", model_info);
+#endif
 }
 
 static obs_properties_t *filter_properties(void *unused)
@@ -915,6 +955,7 @@ static struct obs_source_frame *filter_video(void *data, struct obs_source_frame
 		filter->roi_ready = roi_extracted;
 		pthread_mutex_unlock(&filter->roi_mutex);
 
+#ifndef NO_INFERENCE
 		// 阶段 3：如果 ROI 提取成功且模型已加载，启动异步推理
 		if (roi_extracted && filter->ort_session) {
 			// 确保推理线程已启动
@@ -931,20 +972,22 @@ static struct obs_source_frame *filter_video(void *data, struct obs_source_frame
 			}
 			pthread_mutex_unlock(&filter->inference_mutex);
 		}
-	}
 
-	// 阶段 4：检查是否有新的检测结果
-	pthread_mutex_lock(&filter->inference_mutex);
-	if (filter->pending_detections_ready) {
-		pthread_mutex_lock(&filter->detections_mutex);
-		filter->detections = filter->pending_detections;
-		pthread_mutex_unlock(&filter->detections_mutex);
-		filter->pending_detections_ready = false;
+		// 阶段 4：检查是否有新的检测结果
+		pthread_mutex_lock(&filter->inference_mutex);
+		if (filter->pending_detections_ready) {
+			pthread_mutex_lock(&filter->detections_mutex);
+			filter->detections = filter->pending_detections;
+			pthread_mutex_unlock(&filter->detections_mutex);
+			filter->pending_detections_ready = false;
+		}
+		pthread_mutex_unlock(&filter->inference_mutex);
+#endif
 	}
-	pthread_mutex_unlock(&filter->inference_mutex);
 
 	// 阶段 5：每 300 帧输出一次日志
 	if (filter->frame_count % 300 == 0) {
+#ifndef NO_INFERENCE
 		obs_log(LOG_INFO,
 			"[MYFILTER] Filter video | Frame: %d | Size: %dx%d | Format: %s | ROI extracted: %s | Model loaded: %s | Thread running: %s",
 			filter->frame_count,
@@ -953,6 +996,14 @@ static struct obs_source_frame *filter_video(void *data, struct obs_source_frame
 			roi_extracted ? "Yes" : "No",
 			filter->ort_session ? "Yes" : "No",
 			filter->inference_thread_running ? "Yes" : "No");
+#else
+		obs_log(LOG_INFO,
+			"[MYFILTER] Filter video | Frame: %d | Size: %dx%d | Format: %s | ROI extracted: %s | Inference: Disabled",
+			filter->frame_count,
+			width, height,
+			"NV12",
+			roi_extracted ? "Yes" : "No");
+#endif
 	}
 
 	return frame;
