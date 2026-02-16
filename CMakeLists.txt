@@ -16,6 +16,16 @@ add_library(${CMAKE_PROJECT_NAME} MODULE)
 find_package(libobs REQUIRED)
 target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::libobs)
 
+# ONNX Runtime
+target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE "$ENV{ORT_PATH}/include")
+target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE "$ENV{ORT_PATH}/lib")
+target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE onnxruntime)
+
+# OpenCV
+target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE "$ENV{OPENCV_PATH}/include")
+target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE "$ENV{OPENCV_PATH}/x64/vc16/lib")
+target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE opencv_world4100)
+
 if(ENABLE_FRONTEND_API)
   find_package(obs-frontend-api REQUIRED)
   target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::obs-frontend-api)

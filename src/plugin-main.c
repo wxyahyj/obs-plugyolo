@@ -23,6 +23,14 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <util/threading.h>
 #include <util/platform.h>
 
+// ONNX Runtime
+#include <onnxruntime_cxx_api.h>
+
+// OpenCV
+#include <opencv2/opencv.hpp>
+#include <opencv2/core/core.hpp>
+#include <opencv2/imgproc/imgproc.hpp>
+
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE("my_first_obs_filter", "en-US")
 
@@ -48,6 +56,39 @@ typedef struct {
 	int frame_count;
 	pthread_mutex_t roi_mutex;
 	bool roi_ready;
+
+	// ONNX Runtime
+	Ort::Env *ort_env;
+	Ort::Session *ort_session;
+	Ort::SessionOptions *ort_options;
+
+	// Model info
+	char *model_path;
+	int input_width;
+	int input_height;
+	int num_classes;
+
+	// Detection params
+	float conf_threshold;
+	float nms_threshold;
+
+	// Classes
+	const char **class_names;
+
+	// Detection results
+	std::vector<detection_result_t> detections;
+	pthread_mutex_t detections_mutex;
+
+	// Async inference
+	pthread_t inference_thread;
+	bool inference_thread_running;
+	bool should_stop_inference;
+	pthread_mutex_t inference_mutex;
+	pthread_cond_t inference_cond;
+	uint8_t *inference_buffer;
+	bool inference_buffer_ready;
+	std::vector<detection_result_t> pending_detections;
+	bool pending_detections_ready;
 } my_filter_data_t;
 
 static my_filter_data_t *g_filter_data = NULL;
@@ -69,6 +110,16 @@ static void *filter_create(obs_data_t *settings, obs_source_t *source)
 	data->roi_buffer = NULL;
 	data->roi_texture = NULL;
 	pthread_mutex_init(&data->roi_mutex, NULL);
+	pthread_mutex_init(&data->detections_mutex, NULL);
+
+	// 初始化异步推理相关变量
+	data->inference_thread_running = false;
+	data->should_stop_inference = false;
+	pthread_mutex_init(&data->inference_mutex, NULL);
+	pthread_cond_init(&data->inference_cond, NULL);
+	data->inference_buffer = bzalloc(ROI_SIZE * ROI_SIZE * ROI_CHANNELS);
+	data->inference_buffer_ready = false;
+	data->pending_detections_ready = false;
 
 	// 尝试创建 shader effect，但即使失败也继续运行（使用 CPU 模式）
 	char *effect_path = obs_module_file("center_roi_gpu.effect");
@@ -100,6 +151,40 @@ static void *filter_create(obs_data_t *settings, obs_source_t *source)
 	// 分配 ROI 缓冲区
 	data->roi_buffer = bzalloc(ROI_SIZE * ROI_SIZE * ROI_CHANNELS);
 
+	// 初始化 ONNX Runtime
+	try {
+		data->ort_env = new Ort::Env(ORT_LOGGING_LEVEL_WARNING, "YOLOFilter");
+		data->ort_options = new Ort::SessionOptions();
+
+		// 设置线程数
+		data->ort_options->SetIntraOpNumThreads(4);
+		data->ort_options->SetInterOpNumThreads(2);
+
+		// 启用内存模式
+		data->ort_options->SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_EXTENDED);
+
+		// 尝试添加 DirectML 执行提供者
+		try {
+			data->ort_options->AppendExecutionProvider_DML(0);
+			obs_log(LOG_INFO, "DirectML execution provider added successfully");
+		} catch (const Ort::Exception &e) {
+			obs_log(LOG_WARNING, "Failed to add DirectML execution provider: %s, falling back to CPU", e.what());
+		}
+
+	} catch (const Ort::Exception &e) {
+		obs_log(LOG_ERROR, "Failed to initialize ONNX Runtime: %s", e.what());
+		// 即使 ONNX Runtime 初始化失败，也继续创建滤镜
+	}
+
+	// 初始化默认参数
+	data->model_path = NULL;
+	data->input_width = 640;
+	data->input_height = 640;
+	data->num_classes = 80;
+	data->conf_threshold = 0.45f;
+	data->nms_threshold = 0.45f;
+	data->class_names = NULL;
+
 	g_filter_data = data;
 
 	obs_log(LOG_INFO, "Filter created successfully (mode: %s)", data->effect ? "GPU" : "CPU");
@@ -114,6 +199,23 @@ static void filter_destroy(void *data)
 		return;
 
 	pthread_mutex_destroy(&filter->roi_mutex);
+	pthread_mutex_destroy(&filter->detections_mutex);
+
+	// 清理异步推理线程
+	if (filter->inference_thread_running) {
+		filter->should_stop_inference = true;
+		pthread_cond_signal(&filter->inference_cond);
+		pthread_join(filter->inference_thread, NULL);
+	}
+
+	// 释放异步推理相关资源
+	if (filter->inference_buffer) {
+		bfree(filter->inference_buffer);
+		filter->inference_buffer = NULL;
+	}
+
+	pthread_mutex_destroy(&filter->inference_mutex);
+	pthread_cond_destroy(&filter->inference_cond);
 
 	if (filter->roi_texture)
 		gs_texture_destroy(filter->roi_texture);
@@ -124,6 +226,34 @@ static void filter_destroy(void *data)
 	if (filter->effect)
 		gs_effect_destroy(filter->effect);
 
+	// 释放 ONNX Runtime 资源
+	if (filter->ort_session) {
+		delete filter->ort_session;
+		filter->ort_session = NULL;
+	}
+
+	if (filter->ort_options) {
+		delete filter->ort_options;
+		filter->ort_options = NULL;
+	}
+
+	if (filter->ort_env) {
+		delete filter->ort_env;
+		filter->ort_env = NULL;
+	}
+
+	// 释放模型路径
+	if (filter->model_path) {
+		bfree(filter->model_path);
+		filter->model_path = NULL;
+	}
+
+	// 释放类别名称
+	if (filter->class_names) {
+		bfree(filter->class_names);
+		filter->class_names = NULL;
+	}
+
 	if (g_filter_data == filter)
 		g_filter_data = NULL;
 
@@ -131,16 +261,163 @@ static void filter_destroy(void *data)
 	obs_log(LOG_INFO, "Filter destroyed");
 }
 
+// 加载 YOLO 模型
+static bool load_yolo_model(my_filter_data_t *filter)
+{
+	if (!filter || !filter->model_path || !filter->ort_env || !filter->ort_options) {
+		return false;
+	}
+
+	try {
+		// 释放旧的会话
+		if (filter->ort_session) {
+			delete filter->ort_session;
+			filter->ort_session = NULL;
+		}
+
+		// 创建新的会话
+		filter->ort_session = new Ort::Session(*filter->ort_env, filter->model_path, *filter->ort_options);
+
+		// 获取输入信息
+		Ort::AllocatorWithDefaultOptions allocator;
+		Ort::AllocatedStringPtr input_name = filter->ort_session->GetInputNameAllocated(0, allocator);
+		Ort::TypeInfo input_type_info = filter->ort_session->GetInputTypeInfo(0);
+		auto input_tensor_info = input_type_info.GetTensorTypeAndShapeInfo();
+
+		// 获取输入形状
+		std::vector<int64_t> input_shape = input_tensor_info.GetShape();
+		if (input_shape.size() == 4) {
+			// 假设输入形状为 [batch, channels, height, width]
+			filter->input_height = (int)input_shape[2];
+			filter->input_width = (int)input_shape[3];
+			obs_log(LOG_INFO, "Auto-detected input size: %dx%d", filter->input_width, filter->input_height);
+		}
+
+		// 获取输出信息
+		Ort::AllocatedStringPtr output_name = filter->ort_session->GetOutputNameAllocated(0, allocator);
+		Ort::TypeInfo output_type_info = filter->ort_session->GetOutputTypeInfo(0);
+		auto output_tensor_info = output_type_info.GetTensorTypeAndShapeInfo();
+
+		// 获取输出形状
+		std::vector<int64_t> output_shape = output_tensor_info.GetShape();
+		if (output_shape.size() == 3) {
+			// 假设输出形状为 [batch, num_detections, 7] 或类似格式
+			// 根据输出维度推断类别数
+			if (output_shape[2] > 5) {
+				filter->num_classes = (int)(output_shape[2] - 5);
+				obs_log(LOG_INFO, "Auto-detected num_classes: %d", filter->num_classes);
+			}
+		}
+
+		obs_log(LOG_INFO, "Model loaded successfully: %s", filter->model_path);
+		return true;
+
+	} catch (const Ort::Exception &e) {
+		obs_log(LOG_ERROR, "Failed to load model: %s", e.what());
+		return false;
+	}
+}
+
 static void filter_update(void *data, obs_data_t *settings)
 {
-	UNUSED_PARAMETER(data);
-	UNUSED_PARAMETER(settings);
+	my_filter_data_t *filter = data;
+	if (!filter)
+		return;
+
+	// 模型路径
+	const char *model_path = obs_data_get_string(settings, "model_path");
+	if (model_path && *model_path) {
+		if (filter->model_path) {
+			bfree(filter->model_path);
+		}
+		filter->model_path = bstrdup(model_path);
+		obs_log(LOG_INFO, "Model path set to: %s", filter->model_path);
+	}
+
+	// 置信度阈值
+	filter->conf_threshold = obs_data_get_double(settings, "conf_threshold");
+	if (filter->conf_threshold <= 0) {
+		filter->conf_threshold = 0.45f;
+	}
+
+	// NMS 阈值
+	filter->nms_threshold = obs_data_get_double(settings, "nms_threshold");
+	if (filter->nms_threshold <= 0) {
+		filter->nms_threshold = 0.45f;
+	}
+
+	// 输入尺寸
+	filter->input_width = obs_data_get_int(settings, "input_width");
+	if (filter->input_width <= 0) {
+		filter->input_width = 640;
+	}
+
+	filter->input_height = obs_data_get_int(settings, "input_height");
+	if (filter->input_height <= 0) {
+		filter->input_height = 640;
+	}
+
+	// 类别数
+	filter->num_classes = obs_data_get_int(settings, "num_classes");
+	if (filter->num_classes <= 0) {
+		filter->num_classes = 80;
+	}
+
+	// 当模型路径改变时，重新加载模型
+	if (filter->model_path && filter->ort_env && filter->ort_options) {
+		bool model_loaded = load_yolo_model(filter);
+		if (model_loaded) {
+			obs_log(LOG_INFO, "Model reloaded successfully");
+		} else {
+			obs_log(LOG_ERROR, "Failed to reload model");
+		}
+	}
+
+	// 更新模型信息
+	char model_info[512];
+	snprintf(model_info, sizeof(model_info), 
+		"输入尺寸: %dx%d\n" 
+		"类别数: %d\n" 
+		"置信度阈值: %.2f\n" 
+		"NMS 阈值: %.2f\n" 
+		"模型路径: %s\n" 
+		"模型状态: %s",
+		filter->input_width, filter->input_height,
+		filter->num_classes,
+		filter->conf_threshold,
+		filter->nms_threshold,
+		filter->model_path ? filter->model_path : "未设置",
+		filter->ort_session ? "已加载" : "未加载");
+
+	obs_data_set_string(settings, "model_info", model_info);
 }
 
 static obs_properties_t *filter_properties(void *unused)
 {
 	UNUSED_PARAMETER(unused);
-	return obs_properties_create();
+
+	obs_properties_t *props = obs_properties_create();
+
+	// 模型路径
+	obs_properties_add_path(props, "model_path", "模型文件路径", OBS_PATH_FILE, "*.onnx", NULL);
+
+	// 置信度阈值
+	obs_properties_add_float_slider(props, "conf_threshold", "置信度阈值", 0.0f, 1.0f, 0.01f);
+
+	// NMS 阈值
+	obs_properties_add_float_slider(props, "nms_threshold", "NMS 阈值", 0.0f, 1.0f, 0.01f);
+
+	// 输入尺寸
+	obs_properties_add_int_slider(props, "input_width", "输入宽度", 320, 1280, 1);
+	obs_properties_add_int_slider(props, "input_height", "输入高度", 320, 1280, 1);
+
+	// 类别数
+	obs_properties_add_int_slider(props, "num_classes", "类别数", 1, 200, 1);
+
+	// 模型信息显示（只读）
+	obs_properties_add_text(props, "model_info", "模型信息", OBS_TEXT_INFO);
+
+	return props;
 }
 
 // NV12 格式说明：
@@ -192,6 +469,13 @@ static void draw_rectangle_nv12(uint8_t *data, int width, int height, int x, int
 	}
 }
 
+// 检测结果结构体
+typedef struct {
+	float x1, y1, x2, y2; // 边界框坐标
+	float confidence;     // 置信度
+	int class_id;         // 类别 ID
+} detection_result_t;
+
 // YUV 转 RGB 函数
 static void yuv_to_rgb(uint8_t y, uint8_t u, uint8_t v, uint8_t *r, uint8_t *g, uint8_t *b)
 {
@@ -211,6 +495,347 @@ static void yuv_to_rgb(uint8_t y, uint8_t u, uint8_t v, uint8_t *r, uint8_t *g, 
 	*r = (uint8_t)r_val;
 	*g = (uint8_t)g_val;
 	*b = (uint8_t)b_val;
+}
+
+// 预处理函数：将图像转换为模型输入格式
+static bool preprocess_image(cv::Mat &image, cv::Mat &output, int input_width, int input_height)
+{
+	if (image.empty()) {
+		return false;
+	}
+
+	// 调整大小（保持宽高比，填充）
+	cv::Mat resized;
+	cv::resize(image, resized, cv::Size(input_width, input_height));
+
+	// 转换为 RGB 格式
+	if (resized.channels() == 4) {
+		cv::cvtColor(resized, resized, cv::COLOR_RGBA2RGB);
+	} else if (resized.channels() == 1) {
+		cv::cvtColor(resized, resized, cv::COLOR_GRAY2RGB);
+	}
+
+	// 归一化
+	resized.convertTo(output, CV_32F, 1.0 / 255.0);
+
+	// 调整通道顺序（HWC -> CHW）
+	cv::dnn::blobFromImage(output, output, 1.0, cv::Size(input_width, input_height), cv::Scalar(0, 0, 0), true, false);
+
+	return true;
+}
+
+// 后处理函数：处理模型输出，应用 NMS
+static std::vector<detection_result_t> postprocess_output(float *output_data, int output_size, int num_classes, float conf_threshold, float nms_threshold)
+{
+	std::vector<detection_result_t> detections;
+
+	// 假设输出格式为 [x, y, w, h, confidence, class1, class2, ...]
+	for (int i = 0; i < output_size; i += (5 + num_classes)) {
+		float x = output_data[i + 0];
+		float y = output_data[i + 1];
+		float w = output_data[i + 2];
+		float h = output_data[i + 3];
+		float confidence = output_data[i + 4];
+
+		if (confidence < conf_threshold) {
+			continue;
+		}
+
+		// 找到最高置信度的类别
+		float max_class_conf = 0;
+		int max_class_id = 0;
+		for (int j = 0; j < num_classes; j++) {
+			float class_conf = output_data[i + 5 + j];
+			if (class_conf > max_class_conf) {
+				max_class_conf = class_conf;
+				max_class_id = j;
+			}
+		}
+
+		// 计算最终置信度
+		float final_conf = confidence * max_class_conf;
+		if (final_conf < conf_threshold) {
+			continue;
+		}
+
+		// 转换为边界框坐标（xywh -> xyxy）
+		detection_result_t det;
+		det.x1 = x - w / 2;
+		det.y1 = y - h / 2;
+		det.x2 = x + w / 2;
+		det.y2 = y + h / 2;
+		det.confidence = final_conf;
+		det.class_id = max_class_id;
+
+		detections.push_back(det);
+	}
+
+	// 应用 NMS
+	std::vector<int> indices;
+	std::vector<float> scores;
+	std::vector<cv::Rect> boxes;
+
+	for (auto &det : detections) {
+		boxes.push_back(cv::Rect(det.x1, det.y1, det.x2 - det.x1, det.y2 - det.y1));
+		scores.push_back(det.confidence);
+	}
+
+	if (!boxes.empty()) {
+		cv::dnn::NMSBoxes(boxes, scores, conf_threshold, nms_threshold, indices);
+	}
+
+	// 过滤出 NMS 后的结果
+	std::vector<detection_result_t> filtered_detections;
+	for (int idx : indices) {
+		filtered_detections.push_back(detections[idx]);
+	}
+
+	return filtered_detections;
+}
+
+// 执行 YOLO 推理
+static std::vector<detection_result_t> run_yolo_inference(my_filter_data_t *filter, cv::Mat &image)
+{
+	std::vector<detection_result_t> detections;
+
+	if (!filter || !filter->ort_session || image.empty()) {
+		return detections;
+	}
+
+	try {
+		// 预处理图像
+		cv::Mat input_blob;
+		if (!preprocess_image(image, input_blob, filter->input_width, filter->input_height)) {
+			return detections;
+		}
+
+		// 准备输入张量
+		Ort::AllocatorWithDefaultOptions allocator;
+		Ort::AllocatedStringPtr input_name = filter->ort_session->GetInputNameAllocated(0, allocator);
+		Ort::AllocatedStringPtr output_name = filter->ort_session->GetOutputNameAllocated(0, allocator);
+
+		std::vector<const char *> input_names = {input_name.get()};
+		std::vector<const char *> output_names = {output_name.get()};
+
+		// 获取输入形状
+		Ort::TypeInfo input_type_info = filter->ort_session->GetInputTypeInfo(0);
+		auto input_tensor_info = input_type_info.GetTensorTypeAndShapeInfo();
+		std::vector<int64_t> input_shape = input_tensor_info.GetShape();
+
+		// 获取输出形状
+		Ort::TypeInfo output_type_info = filter->ort_session->GetOutputTypeInfo(0);
+		auto output_tensor_info = output_type_info.GetTensorTypeAndShapeInfo();
+		std::vector<int64_t> output_shape = output_tensor_info.GetShape();
+
+		// 创建输入张量
+		Ort::MemoryInfo memory_info = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+		Ort::Value input_tensor = Ort::Value::CreateTensor<float>(
+			memory_info,
+			(float *)input_blob.ptr<float>(),
+			input_blob.total(),
+			input_shape.data(),
+			input_shape.size()
+		);
+
+		// 运行推理
+		auto output_tensors = filter->ort_session->Run(
+			Ort::RunOptions{nullptr},
+			input_names.data(),
+			&input_tensor,
+			1,
+			output_names.data(),
+			1
+		);
+
+		// 处理输出
+		float *output_data = output_tensors[0].GetTensorMutableData<float>();
+		int output_size = 1;
+		for (auto dim : output_shape) {
+			output_size *= dim;
+		}
+
+		// 后处理
+		detections = postprocess_output(
+			output_data,
+			output_size,
+			filter->num_classes,
+			filter->conf_threshold,
+			filter->nms_threshold
+		);
+
+	} catch (const Ort::Exception &e) {
+		obs_log(LOG_ERROR, "Inference failed: %s", e.what());
+	} catch (const std::exception &e) {
+		obs_log(LOG_ERROR, "Inference failed: %s", e.what());
+	}
+
+	return detections;
+}
+
+// 获取类别名称
+static const char *get_class_name(int class_id)
+{
+	// 默认类别名称
+	static const char *default_classes[] = {
+		"敌人", "队友", "热能", "小兵"
+	};
+
+	if (class_id >= 0 && class_id < 4) {
+		return default_classes[class_id];
+	}
+	return "未知";
+}
+
+// 绘制检测结果
+static void draw_detections(my_filter_data_t *filter)
+{
+	if (!filter) {
+		return;
+	}
+
+	// 获取检测结果
+	std::vector<detection_result_t> detections;
+	pthread_mutex_lock(&filter->detections_mutex);
+	detections = filter->detections;
+	pthread_mutex_unlock(&filter->detections_mutex);
+
+	if (detections.empty()) {
+		return;
+	}
+
+	// 计算 ROI 在原始画面中的位置
+	int width = filter->width;
+	int height = filter->height;
+	int roi_x = (width - ROI_SIZE) / 2;
+	int roi_y = (height - ROI_SIZE) / 2;
+
+	// 创建一个临时的渲染目标来绘制检测结果
+	gs_texture_t *render_target = gs_get_render_target();
+	if (!render_target) {
+		return;
+	}
+
+	// 设置颜色
+	float color[4] = {1.0f, 0.0f, 0.0f, 1.0f}; // 红色
+	gs_set_color(color);
+
+	// 绘制每个检测结果
+	for (auto &det : detections) {
+		// 将相对坐标转换为绝对坐标
+		float x1 = roi_x + det.x1;
+		float y1 = roi_y + det.y1;
+		float x2 = roi_x + det.x2;
+		float y2 = roi_y + det.y2;
+
+		// 确保坐标在有效范围内
+		x1 = std::max(0.0f, std::min((float)width, x1));
+		y1 = std::max(0.0f, std::min((float)height, y1));
+		x2 = std::max(0.0f, std::min((float)width, x2));
+		y2 = std::max(0.0f, std::min((float)height, y2));
+
+		// 绘制边界框
+		gs_draw_sprite(NULL, 0, (int)(x2 - x1), (int)(y2 - y1));
+
+		// 这里可以添加绘制标签的代码
+		// 由于 OBS 的 GS API 不直接支持文本绘制，我们需要使用其他方法
+		// 例如，使用 FreeType 或者预渲染文本纹理
+	}
+
+	// 恢复渲染目标
+	gs_set_render_target(render_target);
+}
+
+// 异步推理线程函数
+static void *inference_thread_func(void *arg)
+{
+	my_filter_data_t *filter = (my_filter_data_t *)arg;
+
+	while (true) {
+		// 等待新的推理任务
+		pthread_mutex_lock(&filter->inference_mutex);
+		while (!filter->inference_buffer_ready && !filter->should_stop_inference) {
+			pthread_cond_wait(&filter->inference_cond, &filter->inference_mutex);
+		}
+
+		// 检查是否需要停止线程
+		if (filter->should_stop_inference) {
+			pthread_mutex_unlock(&filter->inference_mutex);
+			break;
+		}
+
+		// 复制推理缓冲区
+		uint8_t *buffer_copy = bzalloc(ROI_SIZE * ROI_SIZE * ROI_CHANNELS);
+		memcpy(buffer_copy, filter->inference_buffer, ROI_SIZE * ROI_SIZE * ROI_CHANNELS);
+		filter->inference_buffer_ready = false;
+		pthread_mutex_unlock(&filter->inference_mutex);
+
+		// 执行推理
+		if (filter->ort_session) {
+			// 将缓冲区转换为 cv::Mat
+			cv::Mat roi_mat(ROI_SIZE, ROI_SIZE, CV_8UC3, buffer_copy);
+
+			// 执行推理
+			auto start_time = std::chrono::high_resolution_clock::now();
+			std::vector<detection_result_t> detections = run_yolo_inference(filter, roi_mat);
+			auto end_time = std::chrono::high_resolution_clock::now();
+			auto inference_time = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
+
+			// 存储检测结果
+			pthread_mutex_lock(&filter->inference_mutex);
+			filter->pending_detections = detections;
+			filter->pending_detections_ready = true;
+			pthread_mutex_unlock(&filter->inference_mutex);
+
+			// 每 300 帧输出一次推理时间
+			if (filter->frame_count % 300 == 0) {
+				obs_log(LOG_INFO, "[MYFILTER] Inference time: %.2f ms", (float)inference_time);
+			}
+		}
+
+		// 释放缓冲区副本
+		bfree(buffer_copy);
+	}
+
+	return NULL;
+}
+
+// 启动异步推理线程
+static void start_inference_thread(my_filter_data_t *filter)
+{
+	if (!filter || filter->inference_thread_running) {
+		return;
+	}
+
+	filter->should_stop_inference = false;
+	int result = pthread_create(&filter->inference_thread, NULL, inference_thread_func, filter);
+	if (result == 0) {
+		filter->inference_thread_running = true;
+		obs_log(LOG_INFO, "Inference thread started successfully");
+	} else {
+		obs_log(LOG_ERROR, "Failed to start inference thread: %d", result);
+	}
+}
+
+// 在 OpenCV 图像上绘制检测结果（用于 CPU 模式）
+static void draw_detections_opencv(cv::Mat &image, std::vector<detection_result_t> &detections)
+{
+	for (auto &det : detections) {
+		// 绘制边界框
+		cv::rectangle(image, 
+			cv::Point(det.x1, det.y1), 
+			cv::Point(det.x2, det.y2), 
+			cv::Scalar(0, 0, 255), 2);
+
+		// 绘制标签
+		std::string label = get_class_name(det.class_id);
+		std::string text = label + " " + std::to_string(det.confidence).substr(0, 4);
+		
+		// 在边界框上方绘制标签
+		cv::putText(image, text, 
+			cv::Point(det.x1, det.y1 - 10), 
+			cv::FONT_HERSHEY_SIMPLEX, 0.5, 
+			cv::Scalar(0, 0, 255), 2);
+	}
 }
 
 // 从 NV12 帧中提取中心 ROI 区域（转换为 RGB 格式）
@@ -289,16 +914,45 @@ static struct obs_source_frame *filter_video(void *data, struct obs_source_frame
 		pthread_mutex_lock(&filter->roi_mutex);
 		filter->roi_ready = roi_extracted;
 		pthread_mutex_unlock(&filter->roi_mutex);
+
+		// 阶段 3：如果 ROI 提取成功且模型已加载，启动异步推理
+		if (roi_extracted && filter->ort_session) {
+			// 确保推理线程已启动
+			if (!filter->inference_thread_running) {
+				start_inference_thread(filter);
+			}
+
+			// 将 ROI 数据复制到推理缓冲区
+			pthread_mutex_lock(&filter->inference_mutex);
+			if (!filter->inference_buffer_ready) {
+				memcpy(filter->inference_buffer, filter->roi_buffer, ROI_SIZE * ROI_SIZE * ROI_CHANNELS);
+				filter->inference_buffer_ready = true;
+				pthread_cond_signal(&filter->inference_cond);
+			}
+			pthread_mutex_unlock(&filter->inference_mutex);
+		}
 	}
 
-	// 阶段 3：每 300 帧输出一次日志
+	// 阶段 4：检查是否有新的检测结果
+	pthread_mutex_lock(&filter->inference_mutex);
+	if (filter->pending_detections_ready) {
+		pthread_mutex_lock(&filter->detections_mutex);
+		filter->detections = filter->pending_detections;
+		pthread_mutex_unlock(&filter->detections_mutex);
+		filter->pending_detections_ready = false;
+	}
+	pthread_mutex_unlock(&filter->inference_mutex);
+
+	// 阶段 5：每 300 帧输出一次日志
 	if (filter->frame_count % 300 == 0) {
 		obs_log(LOG_INFO,
-			"[MYFILTER] Filter video | Frame: %d | Size: %dx%d | Format: %s | ROI extracted: %s",
+			"[MYFILTER] Filter video | Frame: %d | Size: %dx%d | Format: %s | ROI extracted: %s | Model loaded: %s | Thread running: %s",
 			filter->frame_count,
 			width, height,
 			"NV12",
-			roi_extracted ? "Yes" : "No");
+			roi_extracted ? "Yes" : "No",
+			filter->ort_session ? "Yes" : "No",
+			filter->inference_thread_running ? "Yes" : "No");
 	}
 
 	return frame;
@@ -407,6 +1061,10 @@ static void video_render(void *data, gs_effect_t *effect)
 	if (width == 0 || height == 0) 
 		return;
 
+	// 更新过滤器的宽度和高度
+	filter->width = width;
+	filter->height = height;
+
 	// 只有在 shader 可用时才执行 GPU 渲染
 	if (filter->effect) {
 		update_roi_texture(filter, width, height);
@@ -443,6 +1101,9 @@ static void video_render(void *data, gs_effect_t *effect)
 
 		obs_source_process_filter_end(filter->context, effect, width, height);
 
+		// 绘制检测结果
+		draw_detections(filter);
+
 		// 在插件支持被禁用的 CI 环境中，跳过 ROI 提取逻辑
 		// obs_filter_get_video_texture 等 API 在禁用插件支持时不可用
 		// 保留 ROI 逻辑但跳过实际执行，确保编译通过
@@ -455,16 +1116,20 @@ static void video_render(void *data, gs_effect_t *effect)
 		obs_source_process_filter_begin(filter->context, GS_RGBA, OBS_ALLOW_DIRECT_RENDERING);
 		gs_draw_sprite(NULL, 0, width, height);
 		obs_source_process_filter_end(filter->context, effect, width, height);
+
+		// 绘制检测结果（CPU 模式）
+		draw_detections(filter);
 	}
 
 	filter->frame_count++;
 
 	if (filter->frame_count % 300 == 0) {
 		obs_log(LOG_INFO,
-			"[MYFILTER] Video render | Size: %dx%d | ROI ready: %s | Mode: %s",
+			"[MYFILTER] Video render | Size: %dx%d | ROI ready: %s | Mode: %s | Detections: %d",
 			width, height,
 			filter->roi_ready ? "Yes" : "No",
-			filter->effect ? "GPU" : "CPU");
+			filter->effect ? "GPU" : "CPU",
+			filter->detections.size());
 	}
 }
 
