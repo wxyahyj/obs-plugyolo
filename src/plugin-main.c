@@ -537,6 +537,7 @@ static void yuv_to_rgb(uint8_t y, uint8_t u, uint8_t v, uint8_t *r, uint8_t *g, 
 	*b = (uint8_t)b_val;
 }
 
+#ifndef NO_INFERENCE
 // 预处理函数：将图像转换为模型输入格式
 static bool preprocess_image(cv::Mat &image, cv::Mat &output, int input_width, int input_height)
 {
@@ -632,7 +633,9 @@ static std::vector<detection_result_t> postprocess_output(float *output_data, in
 
 	return filtered_detections;
 }
+#endif
 
+#ifndef NO_INFERENCE
 // 执行 YOLO 推理
 static std::vector<detection_result_t> run_yolo_inference(my_filter_data_t *filter, cv::Mat &image)
 {
@@ -711,6 +714,7 @@ static std::vector<detection_result_t> run_yolo_inference(my_filter_data_t *filt
 
 	return detections;
 }
+#endif
 
 // 获取类别名称
 static const char *get_class_name(int class_id)
@@ -726,6 +730,7 @@ static const char *get_class_name(int class_id)
 	return "未知";
 }
 
+#ifndef NO_INFERENCE
 // 绘制检测结果
 static void draw_detections(my_filter_data_t *filter)
 {
@@ -757,7 +762,9 @@ static void draw_detections(my_filter_data_t *filter)
 
 	// 设置颜色
 	float color[4] = {1.0f, 0.0f, 0.0f, 1.0f}; // 红色
-	gs_set_color(color);
+	// 使用 gs_set_blend_state 代替 gs_set_color
+	gs_blend_state_push();
+	gs_set_blend_state(GS_BLEND_NORMAL, color, 0.0f);
 
 	// 绘制每个检测结果
 	for (auto &det : detections) {
@@ -783,8 +790,13 @@ static void draw_detections(my_filter_data_t *filter)
 
 	// 恢复渲染目标
 	gs_set_render_target(render_target);
+	
+	// 恢复混合状态
+	gs_blend_state_pop();
 }
+#endif
 
+#ifndef NO_INFERENCE
 // 异步推理线程函数
 static void *inference_thread_func(void *arg)
 {
@@ -838,7 +850,9 @@ static void *inference_thread_func(void *arg)
 
 	return NULL;
 }
+#endif
 
+#ifndef NO_INFERENCE
 // 启动异步推理线程
 static void start_inference_thread(my_filter_data_t *filter)
 {
@@ -855,7 +869,9 @@ static void start_inference_thread(my_filter_data_t *filter)
 		obs_log(LOG_ERROR, "Failed to start inference thread: %d", result);
 	}
 }
+#endif
 
+#ifndef NO_INFERENCE
 // 在 OpenCV 图像上绘制检测结果（用于 CPU 模式）
 static void draw_detections_opencv(cv::Mat &image, std::vector<detection_result_t> &detections)
 {
@@ -877,6 +893,7 @@ static void draw_detections_opencv(cv::Mat &image, std::vector<detection_result_
 			cv::Scalar(0, 0, 255), 2);
 	}
 }
+#endif
 
 // 从 NV12 帧中提取中心 ROI 区域（转换为 RGB 格式）
 static bool extract_center_roi(struct obs_source_frame *frame, int roi_width, int roi_height, uint8_t *out_buffer)
