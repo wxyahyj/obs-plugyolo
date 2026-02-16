@@ -1170,7 +1170,9 @@ static void video_render(void *data, gs_effect_t *effect)
 		obs_source_process_filter_end(filter->context, effect, width, height);
 
 		// 绘制检测结果
+		#ifndef NO_INFERENCE
 		draw_detections(filter);
+		#endif
 
 		// 在插件支持被禁用的 CI 环境中，跳过 ROI 提取逻辑
 		// obs_filter_get_video_texture 等 API 在禁用插件支持时不可用
@@ -1186,18 +1188,28 @@ static void video_render(void *data, gs_effect_t *effect)
 		obs_source_process_filter_end(filter->context, effect, width, height);
 
 		// 绘制检测结果（CPU 模式）
+		#ifndef NO_INFERENCE
 		draw_detections(filter);
+		#endif
 	}
 
 	filter->frame_count++;
 
 	if (filter->frame_count % 300 == 0) {
+		#ifndef NO_INFERENCE
 		obs_log(LOG_INFO,
 			"[MYFILTER] Video render | Size: %dx%d | ROI ready: %s | Mode: %s | Detections: %d",
 			width, height,
 			filter->roi_ready ? "Yes" : "No",
 			filter->effect ? "GPU" : "CPU",
 			filter->detections.size());
+		#else
+		obs_log(LOG_INFO,
+			"[MYFILTER] Video render | Size: %dx%d | ROI ready: %s | Mode: %s | Inference: Disabled",
+			width, height,
+			filter->roi_ready ? "Yes" : "No",
+			filter->effect ? "GPU" : "CPU");
+		#endif
 	}
 }
 
