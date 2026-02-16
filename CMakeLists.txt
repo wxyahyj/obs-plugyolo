@@ -47,8 +47,28 @@ include(helpers)
 
 add_library(${CMAKE_PROJECT_NAME} MODULE)
 
-find_package(libobs REQUIRED)
-target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::libobs)
+# 查找 libobs
+if(DEFINED ENV{OBS_PATH})
+    # 使用环境变量指定的 OBS 路径
+    set(OBS_INCLUDE_DIR "$ENV{OBS_PATH}/include")
+    set(OBS_LIB_DIR "$ENV{OBS_PATH}/lib")
+    if(EXISTS "${OBS_INCLUDE_DIR}" AND EXISTS "${OBS_LIB_DIR}")
+        include_directories(${OBS_INCLUDE_DIR})
+        link_directories(${OBS_LIB_DIR})
+        target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE obs)
+        message(STATUS "Using libobs from ENV{OBS_PATH}: $ENV{OBS_PATH}")
+    else()
+        # 如果环境变量指定的路径不存在，尝试使用 find_package
+        find_package(libobs REQUIRED)
+        target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::libobs)
+        message(STATUS "Using libobs from find_package")
+    endif()
+else()
+    # 尝试使用 find_package 查找 libobs
+    find_package(libobs REQUIRED)
+    target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::libobs)
+    message(STATUS "Using libobs from find_package")
+endif()
 
 # 检查是否存在 ONNX Runtime
 option(ENABLE_ONNX "Enable ONNX Runtime support" ON)
