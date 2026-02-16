@@ -113,7 +113,7 @@ static my_filter_data_t *g_filter_data = NULL;
 static const char *filter_get_name(void *unused)
 {
 	UNUSED_PARAMETER(unused);
-	return "操作显示";
+	return "yolo大王来了";
 }
 
 static void *filter_create(obs_data_t *settings, obs_source_t *source)
@@ -391,10 +391,10 @@ static void filter_update(void *data, obs_data_t *settings)
 		filter->input_height = 640;
 	}
 
-	// 类别数
+	// 类别数（0-6）
 	filter->num_classes = obs_data_get_int(settings, "num_classes");
-	if (filter->num_classes <= 0) {
-		filter->num_classes = 80;
+	if (filter->num_classes < 0 || filter->num_classes > 6) {
+		filter->num_classes = 4;
 	}
 
 	// 当模型路径改变时，重新加载模型
@@ -451,8 +451,15 @@ static obs_properties_t *filter_properties(void *unused)
 	obs_properties_add_int_slider(props, "input_width", "输入宽度", 320, 1280, 1);
 	obs_properties_add_int_slider(props, "input_height", "输入高度", 320, 1280, 1);
 
-	// 类别数
-	obs_properties_add_int_slider(props, "num_classes", "类别数", 1, 200, 1);
+	// 类别数（0-6，勾选选择）
+	obs_properties_add_list(props, "num_classes", "类别数", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+	obs_property_list_add_int(obs_properties_get(props, "num_classes"), "0", 0);
+	obs_property_list_add_int(obs_properties_get(props, "num_classes"), "1", 1);
+	obs_property_list_add_int(obs_properties_get(props, "num_classes"), "2", 2);
+	obs_property_list_add_int(obs_properties_get(props, "num_classes"), "3", 3);
+	obs_property_list_add_int(obs_properties_get(props, "num_classes"), "4", 4);
+	obs_property_list_add_int(obs_properties_get(props, "num_classes"), "5", 5);
+	obs_property_list_add_int(obs_properties_get(props, "num_classes"), "6", 6);
 
 	// 模型信息显示（只读）
 	obs_properties_add_text(props, "model_info", "模型信息", OBS_TEXT_INFO);
