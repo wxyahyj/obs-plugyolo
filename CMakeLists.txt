@@ -47,10 +47,23 @@ include(helpers)
 
 add_library(${CMAKE_PROJECT_NAME} MODULE)
 
-# 查找 libobs（使用默认的 find_package，因为 CI 环境中会构建 OBS）
+# 查找 libobs（设置 libobs_DIR 以确保找到配置文件）
+if(DEFINED ENV{OBS_INSTALL_DIR})
+    # CI 环境中 OBS 的安装路径
+    set(OBS_INSTALL_DIR "$ENV{OBS_INSTALL_DIR}")
+    set(libobs_DIR "${OBS_INSTALL_DIR}/lib/cmake/libobs")
+    message(STATUS "Setting libobs_DIR to: ${libobs_DIR}")
+elseif(DEFINED ENV{OBS_PATH})
+    # 本地开发环境中的 OBS 路径
+    set(OBS_PATH "$ENV{OBS_PATH}")
+    set(libobs_DIR "${OBS_PATH}/lib/cmake/libobs")
+    message(STATUS "Setting libobs_DIR to: ${libobs_DIR}")
+endif()
+
+# 查找 libobs
 find_package(libobs REQUIRED)
 target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::libobs)
-message(STATUS "Using libobs from CI build")
+message(STATUS "Using libobs from: ${libobs_DIR}")
 
 # 检查是否存在 ONNX Runtime（优先使用 vcpkg）
 option(ENABLE_ONNX "Enable ONNX Runtime support" ON)
