@@ -47,76 +47,40 @@ include(helpers)
 
 add_library(${CMAKE_PROJECT_NAME} MODULE)
 
-# 查找 libobs
-if(DEFINED ENV{OBS_PATH})
-    # 使用环境变量指定的 OBS 路径
-    set(OBS_INCLUDE_DIR "$ENV{OBS_PATH}/include")
-    set(OBS_LIB_DIR "$ENV{OBS_PATH}/lib")
-    if(EXISTS "${OBS_INCLUDE_DIR}" AND EXISTS "${OBS_LIB_DIR}")
-        include_directories(${OBS_INCLUDE_DIR})
-        link_directories(${OBS_LIB_DIR})
-        target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE obs)
-        message(STATUS "Using libobs from ENV{OBS_PATH}: $ENV{OBS_PATH}")
-    else()
-        # 如果环境变量指定的路径不存在，尝试使用 find_package
-        find_package(libobs REQUIRED)
-        target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::libobs)
-        message(STATUS "Using libobs from find_package")
-    endif()
-else()
-    # 尝试使用 find_package 查找 libobs
-    find_package(libobs REQUIRED)
-    target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::libobs)
-    message(STATUS "Using libobs from find_package")
-endif()
+# 查找 libobs（使用默认的 find_package，因为 CI 环境中会构建 OBS）
+find_package(libobs REQUIRED)
+target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::libobs)
+message(STATUS "Using libobs from CI build")
 
-# 检查是否存在 ONNX Runtime
+# 检查是否存在 ONNX Runtime（优先使用 vcpkg）
 option(ENABLE_ONNX "Enable ONNX Runtime support" ON)
 if(ENABLE_ONNX)
-    # 尝试使用 vcpkg 查找 ONNX Runtime
-    find_package(onnxruntime QUIET)
+    # 强制使用 vcpkg 查找 ONNX Runtime
+    find_package(onnxruntime REQUIRED)
     if(onnxruntime_FOUND)
         target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE onnxruntime::onnxruntime)
         target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE HAVE_ONNX)
         message(STATUS "Found ONNX Runtime via vcpkg: ${onnxruntime_VERSION}")
     else()
-        # 如果 vcpkg 失败，尝试使用环境变量
-        if(DEFINED ENV{ORT_PATH})
-            target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE "$ENV{ORT_PATH}/include")
-            target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE "$ENV{ORT_PATH}/lib")
-            target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE onnxruntime)
-            target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE HAVE_ONNX)
-            message(STATUS "Using ONNX Runtime from ENV{ORT_PATH}: $ENV{ORT_PATH}")
-        else()
-            # 如果环境变量也没有设置，禁用 ONNX 支持
-            message(STATUS "ONNX Runtime not found, disabling ONNX support")
-            set(ENABLE_ONNX OFF)
-        endif()
+        # 如果 vcpkg 失败，禁用 ONNX 支持
+        message(STATUS "ONNX Runtime not found in vcpkg, disabling ONNX support")
+        set(ENABLE_ONNX OFF)
     endif()
 endif()
 
-# 检查是否存在 OpenCV
+# 检查是否存在 OpenCV（优先使用 vcpkg）
 option(ENABLE_OPENCV "Enable OpenCV support" ON)
 if(ENABLE_OPENCV)
-    # 尝试使用 vcpkg 查找 OpenCV
-    find_package(OpenCV QUIET)
+    # 强制使用 vcpkg 查找 OpenCV
+    find_package(OpenCV REQUIRED)
     if(OpenCV_FOUND)
         target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE ${OpenCV_LIBS})
         target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE HAVE_OPENCV)
         message(STATUS "Found OpenCV via vcpkg: ${OpenCV_VERSION}")
     else()
-        # 如果 vcpkg 失败，尝试使用环境变量
-        if(DEFINED ENV{OPENCV_PATH})
-            target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE "$ENV{OPENCV_PATH}/include")
-            target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE "$ENV{OPENCV_PATH}/x64/vc16/lib")
-            target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE opencv_world4100)
-            target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE HAVE_OPENCV)
-            message(STATUS "Using OpenCV from ENV{OPENCV_PATH}: $ENV{OPENCV_PATH}")
-        else()
-            # 如果环境变量也没有设置，禁用 OpenCV 支持
-            message(STATUS "OpenCV not found, disabling OpenCV support")
-            set(ENABLE_OPENCV OFF)
-        endif()
+        # 如果 vcpkg 失败，禁用 OpenCV 支持
+        message(STATUS "OpenCV not found in vcpkg, disabling OpenCV support")
+        set(ENABLE_OPENCV OFF)
     endif()
 endif()
 
