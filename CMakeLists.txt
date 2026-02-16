@@ -3,10 +3,36 @@ cmake_minimum_required(VERSION 3.28...3.30)
 # 支持 vcpkg
 if(DEFINED ENV{VCPKG_ROOT} AND NOT DEFINED CMAKE_TOOLCHAIN_FILE)
     set(CMAKE_TOOLCHAIN_FILE "$ENV{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake" CACHE STRING "Vcpkg toolchain file")
+elseif(NOT DEFINED CMAKE_TOOLCHAIN_FILE)
+    # 如果没有设置 VCPKG_ROOT，使用 GitHub 上的 vcpkg
+    set(VCPKG_REPO "https://github.com/microsoft/vcpkg.git")
+    set(VCPKG_ROOT "${CMAKE_BINARY_DIR}/vcpkg")
+    if(NOT EXISTS "${VCPKG_ROOT}")
+        message(STATUS "Cloning vcpkg from GitHub...")
+        execute_process(
+            COMMAND git clone --depth 1 ${VCPKG_REPO} ${VCPKG_ROOT}
+            RESULT_VARIABLE GIT_RESULT
+            OUTPUT_QUIET
+            ERROR_QUIET
+        )
+        if(GIT_RESULT EQUAL 0)
+            message(STATUS "vcpkg cloned successfully")
+        else()
+            message(WARNING "Failed to clone vcpkg, using fallback method")
+        endif()
+    endif()
+    if(EXISTS "${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake")
+        set(CMAKE_TOOLCHAIN_FILE "${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake" CACHE STRING "Vcpkg toolchain file")
+        message(STATUS "Using vcpkg from GitHub: ${VCPKG_ROOT}")
+    else()
+        message(WARNING "vcpkg not found, using system dependencies")
+    endif()
 endif()
 
 # vcpkg 依赖
 set(VCPKG_MANIFEST_FEATURES "gpu")
+set(VCPKG_OVERLAY_PORTS "${CMAKE_SOURCE_DIR}/vcpkg-ports")
+set(VCPKG_OVERLAY_TRIPLETS "${CMAKE_SOURCE_DIR}/vcpkg-triplets")
 
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/common/bootstrap.cmake" NO_POLICY_SCOPE)
 
@@ -24,20 +50,63 @@ add_library(${CMAKE_PROJECT_NAME} MODULE)
 find_package(libobs REQUIRED)
 target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::libobs)
 
-# 使用 vcpkg 管理依赖
-find_package(onnxruntime REQUIRED)
-find_package(OpenCV REQUIRED)
+# 检查是否存在 ONNX Runtime
+option(ENABLE_ONNX "Enable ONNX Runtime support" ON)
+if(ENABLE_ONNX)
+    # 尝试使用 vcpkg 查找 ONNX Runtime
+    find_package(onnxruntime QUIET)
+    if(onnxruntime_FOUND)
+        target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE onnxruntime::onnxruntime)
+        target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE HAVE_ONNX)
+        message(STATUS "Found ONNX Runtime via vcpkg: ${onnxruntime_VERSION}")
+    else()
+        # 如果 vcpkg 失败，尝试使用环境变量
+        if(DEFINED ENV{ORT_PATH})
+            target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE "$ENV{ORT_PATH}/include")
+            target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE "$ENV{ORT_PATH}/lib")
+            target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE onnxruntime)
+            target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE HAVE_ONNX)
+            message(STATUS "Using ONNX Runtime from ENV{ORT_PATH}: $ENV{ORT_PATH}")
+        else()
+            # 如果环境变量也没有设置，禁用 ONNX 支持
+            message(STATUS "ONNX Runtime not found, disabling ONNX support")
+            set(ENABLE_ONNX OFF)
+        endif()
+    endif()
+endif()
 
-# 链接依赖
-target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE onnxruntime::onnxruntime)
-target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE ${OpenCV_LIBS})
+# 检查是否存在 OpenCV
+option(ENABLE_OPENCV "Enable OpenCV support" ON)
+if(ENABLE_OPENCV)
+    # 尝试使用 vcpkg 查找 OpenCV
+    find_package(OpenCV QUIET)
+    if(OpenCV_FOUND)
+        target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE ${OpenCV_LIBS})
+        target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE HAVE_OPENCV)
+        message(STATUS "Found OpenCV via vcpkg: ${OpenCV_VERSION}")
+    else()
+        # 如果 vcpkg 失败，尝试使用环境变量
+        if(DEFINED ENV{OPENCV_PATH})
+            target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE "$ENV{OPENCV_PATH}/include")
+            target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE "$ENV{OPENCV_PATH}/x64/vc16/lib")
+            target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE opencv_world4100)
+            target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE HAVE_OPENCV)
+            message(STATUS "Using OpenCV from ENV{OPENCV_PATH}: $ENV{OPENCV_PATH}")
+        else()
+            # 如果环境变量也没有设置，禁用 OpenCV 支持
+            message(STATUS "OpenCV not found, disabling OpenCV support")
+            set(ENABLE_OPENCV OFF)
+        endif()
+    endif()
+endif()
 
-# 添加编译定义
-target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE HAVE_ONNX)
-target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE HAVE_OPENCV)
-
-message(STATUS "Using ONNX Runtime from vcpkg: ${onnxruntime_VERSION}")
-message(STATUS "Using OpenCV from vcpkg: ${OpenCV_VERSION}")
+# 配置编译定义
+if(NOT ENABLE_ONNX OR NOT ENABLE_OPENCV)
+    target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE NO_INFERENCE)
+    message(STATUS "Inference disabled due to missing dependencies")
+else()
+    message(STATUS "Inference enabled with GPU acceleration")
+endif()
 
 if(ENABLE_FRONTEND_API)
   find_package(obs-frontend-api REQUIRED)
