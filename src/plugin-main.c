@@ -391,10 +391,10 @@ static void filter_update(void *data, obs_data_t *settings)
 		filter->input_height = 640;
 	}
 
-	// 类别数（0-6）
+	// 类别数
 	filter->num_classes = obs_data_get_int(settings, "num_classes");
-	if (filter->num_classes < 0 || filter->num_classes > 6) {
-		filter->num_classes = 4;
+	if (filter->num_classes <= 0) {
+		filter->num_classes = 80;
 	}
 
 	// 当模型路径改变时，重新加载模型
